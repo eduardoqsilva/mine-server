@@ -1,0 +1,5 @@
+aiogram>=3.13,<4
+docker>=7.1,<8
+# python:3.12-slim nao tem /usr/share/zoneinfo; sem isso ZoneInfo("America/Sao_Paulo")
+# estoura no boot e o agendador das 05:00 nunca roda.
+tzdata>=2024.1

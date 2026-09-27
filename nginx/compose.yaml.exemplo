@@ -1,0 +1,42 @@
+# Exemplo para o compose do nginx que ja existe em /home/ubuntu/docker/nginx.
+# NAO copie este arquivo por cima do seu sem conferir: aqui estao apenas as
+# partes que o Minecraft precisa. Compare com o seu e some.
+#
+# As quatro coisas novas sao:
+#   - a porta 19132/tcp (o signalling do nethernet e HTTP sobre TCP; o
+#     container do jogo nao publica nada, so o nginx)
+#   - a faixa 19133-19172/udp (o gameplay do WebRTC; sem ela o handshake
+#     completa e o jogo trava ao entrar)
+#   - o mount do nginx.conf principal (la mora o bloco stream {})
+#   - o mount do stream.d/, que so e preciso se o nginx.conf tiver o include
+#     "include /etc/nginx/stream.d/*.conf;" dentro do stream {}
+#
+# As portas /udp tem que bater com o server-udp-ports do container do jogo.
+#
+# Salve como compose.yaml e rode:  docker compose config && docker compose up -d
+# (recriar o container derruba o site por alguns segundos) e depois
+# docker exec nginx nginx -t
+
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "19132:19132/tcp"              # <- signalling do nethernet
+      - "19133-19172:19133-19172/udp"   # <- gameplay WebRTC
+    volumes:
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - ./html:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro        # <- precisa do stream {}
+      - ./stream.d:/etc/nginx/stream.d:ro            # <- so se houver include
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+    name: proxy

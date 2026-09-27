@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Revolucao">
+  <defs>
+    <linearGradient id="field" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="rgb(34, 38, 46)"/>
+      <stop offset="1" stop-color="rgb(12, 14, 18)"/>
+    </linearGradient>
+    <linearGradient id="flag" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="rgb(239, 43, 52)"/>
+      <stop offset="1" stop-color="rgb(168, 15, 25)"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.62" cy="0.38" r="0.6">
+      <stop offset="0" stop-color="rgb(214,32,42)" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="rgb(214,32,42)" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="6" y="6" width="244" height="244" rx="44" fill="url(#field)"/>
+  <rect x="6" y="6" width="244" height="244" rx="44" fill="url(#glow)"/>
+  <rect x="44" y="44" width="14" height="168" rx="7" fill="rgb(47, 53, 64)"/>
+  <circle cx="49" cy="46" r="9" fill="rgb(69, 77, 92)"/>
+  <path d="M 56,52 C 110,64 170,40 224,56 C 232,92 232,134 224,170 C 170,186 110,146 56,168 Z" fill="url(#flag)"/>
+  <polygon points="140.0,74.0 148.8,97.9 174.2,98.9 154.3,114.6 161.2,139.1 140.0,125.0 118.8,139.1 125.7,114.6 105.8,98.9 131.2,97.9" fill="rgb(247, 249, 251)"/>
+  <rect x="6" y="6" width="244" height="244" rx="44" fill="none" stroke="rgb(7, 8, 10)" stroke-width="4"/>
+</svg>

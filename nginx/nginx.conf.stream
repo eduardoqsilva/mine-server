@@ -1,0 +1,34 @@
+# Trecho para SOMAR ao nginx.conf atual. Nao substitua o arquivo inteiro:
+# o seu nginx.conf tem as configs de TLS/Cloudflare e elas precisam ficar.
+#
+# 1. No topo do nginx.conf, junto dos outros load_module, garanta:
+#       load_module /etc/nginx/modules/ngx_stream_module.so;
+# 2. No fim do arquivo, depois do bloco http { ... }, acrescente o bloco abaixo.
+#    (Se voce montou o repo inteiro em /etc/nginx/stream.d, o include carrega o
+#     minecraft.conf e voce pode remover o server{} de dentro, mas nao o bloco
+#     stream nem o include ao mesmo tempo - daria dois "server" na mesma porta.)
+# 3. Recarregue com:  docker exec nginx nginx -t && docker exec nginx nginx -s reload
+
+stream {
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    # signalling do nethernet: HTTP sobre TCP. E o que o log do BDS anuncia
+    # ("Accepting clients on [::]:19132") e o que a doc dele manda expor
+    # atras de reverse proxy.
+    server {
+        listen 0.0.0.0:19132;
+        set $jogo mine-bedrock:19132;
+        proxy_pass $jogo;
+        proxy_connect_timeout 5s;
+        proxy_timeout 300s;
+    }
+
+    # gameplay WebRTC: a faixa tem que bater com o server-udp-ports do BDS.
+    server {
+        listen 19133-19172 udp reuseport;
+        set $jogo_udp mine-bedrock:19133-19172;
+        proxy_pass $jogo_udp;
+        proxy_responses 0;
+        proxy_timeout 3600s;
+    }
+}

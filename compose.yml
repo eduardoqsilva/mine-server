@@ -1,0 +1,102 @@
+name: mine-bedrock
+
+# A rede "proxy" (172.23.0.0/16) ja existe na VPS e e o unico caminho de entrada:
+# o container nginx e o unico com portas publicadas. Com transport=nethernet
+# sao duas, porque o protocolo tem duas etapas:
+#   - TCP 19132    signalling HTTP, o handshake em si
+#   - UDP 19133-72 gameplay WebRTC, faixa fixada por server-udp-ports
+# Ver nginx/stream.d/minecraft.conf. O bds nao publica nada.
+networks:
+  proxy:
+    external: true
+
+services:
+  bds:
+    image: itzg/minecraft-bedrock-server:stable
+    pull_policy: daily
+    container_name: mine-bedrock
+    restart: unless-stopped
+    stop_grace_period: 120s
+    tty: true
+    stdin_open: true
+    # O healthcheck da propria imagem roda mc-monitor, que faz ping raknet e
+    # nunca tem resposta sob transport=nethernet (era o bug de pong de 33 bytes,
+    # issue itzg#649, que nao existe mais nesse transporte). Desligado: quem
+    # checa de verdade e o /status do bot, que le o log do boot atual
+    # ("Server started.") e mostra quantos jogadores estao online.
+    healthcheck:
+      disable: true
+    environment:
+      EULA: "TRUE"
+      # Reavalia a cada start: no restart das 05:00 cai para a estavel mais nova.
+      VERSION: "${VERSION:-LATEST}"
+      UID: "${PUID:-1000}"
+      GID: "${PGID:-1000}"
+      TZ: "${TZ:-America/Sao_Paulo}"
+      # Aviso importante: daqui para baixo estao SO as variaveis de primeira
+      # instalacao. Nao coloque aqui gamemode, difficulty, max-players,
+      # view-distance, server-name, allow-list, level-name, white-list ou
+      # default-player-permission-level: o image reescreve
+      # /data/server.properties em todo boot e ganharia a ultima palavra, jogando
+      # fora o que o admin mudou pelo bot (/config no Telegram). O proprio bot
+      # grava em server.properties, que e a fonte da verdade, e reaplica o que
+      # ele guardou no SQLite (/config aplicar ou o reconciliador de 60s).
+      #
+      # LEVEL_NAME aqui so serve para criar o mundo no primeiro start, porque o
+      # image escolhe /data/worlds/<LEVEL_NAME>. Depois disso quem manda no nome
+      # da pasta e server.properties, que o bot le.
+      LEVEL_NAME: "${LEVEL_NAME:-world}"
+      # Workaround do bug de pong do Mojang (BDS >= 1.26.30 devolve 33 bytes
+      # sem "MCPE;", issue itzg#649). Fuerza o caminho de handshake LAN, que
+      # responde certo. Efeito colateral: o BDS passa a bindar 19132/19133
+      # (as portas padrao) - irrelevante aqui, que so roda um servidor.
+      ENABLE_LAN_VISIBILITY: "true"
+      CONTENT_LOG_FILE_ENABLED: "true"
+      CONTENT_LOG_LEVEL: "info"
+      # O aviso de desligamento e do bot (ele sabe o motivo: atualizacao, pack
+      # novo...). Deixamos o do image em 0 para nao duplicar a contagem: com
+      # STOP_SERVER_ANNOUNCE_DELAY > 0 o image escreve o aviso no SIGTERM e
+      # so depois de N segundos manda o "stop", o que daria 2 esperas em
+      # fila. O "stop" imediato ainda salva o mundo, e o stop_grace_period
+      # abaixo cobre o caso do SIGKILL.
+      STOP_SERVER_ANNOUNCE_DELAY: "0"
+      OPS: "${OPS:-}"
+    volumes:
+      - ./data:/data
+      # O BDS ignora este arquivo (Bedrock nao tem icone de servidor proprio),
+      # mas fica montado para o caso de um dia rodar Geyser/Java na frente.
+      - ./assets/server-icon.png:/data/server-icon.png:ro
+    networks:
+      - proxy
+
+  bot:
+    build:
+      context: ./bot
+    image: mine-bedrock-bot:latest
+    container_name: mine-bedrock-bot
+    restart: unless-stopped
+    # mesmo uid/gid do bds: senao o bot cria arquivos no /data que o BDS nao consegue reescrever
+    user: "${PUID:-1000}:${PGID:-1000}"
+    env_file:
+      - .env
+    environment:
+      TZ: "${TZ:-America/Sao_Paulo}"
+      BDS_CONTAINER: "mine-bedrock"
+      BDS_DATA_DIR: "/data"
+      STATE_DIR: "/state"
+    volumes:
+      - ./data:/data
+      # /state: o bot.db (usuarios, hashes das chaves, overrides, auditoria).
+      # Precisa ser volume: se ficar no container, um recreate apaga os acessos.
+      - ./state:/state
+      # icon e logs de staging, so de leitura
+      - ./assets/server-icon.png:/app/assets/server-icon.png:ro
+      # root no host: quem manda no bot manda no docker. Mitigado pelo codigo de
+      # resgate (um admin so, escolhido pelo segredo do .env) e pelas chaves de
+      # leitura, que nao entram em nenhum comando de docker. O bot nao expoe
+      # porta nenhuma e so conversa com o Telegram.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - proxy
+    depends_on:
+      - bds

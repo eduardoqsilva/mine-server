@@ -1,0 +1,6 @@
+.env
+compose.override.yml
+data/
+state/
+__pycache__/
+*.pyc
