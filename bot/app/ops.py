@@ -119,8 +119,7 @@ async def status_lines(ctx: AppContext) -> list[str]:
         body.append(
             txt.aviso(
                 "Pong sem MCPE;... - bug do Mojang (itzg#649). "
-                "Com ENABLE_LAN_VISIBILITY=true os clientes conectam; se ainda nao "
-                "conectarem, me avise que eu monto o proxy UDP que corrige o pong."
+                "Com ENABLE_LAN_VISIBILITY=true os clientes conectam mesmo assim."
             )
         )
 

@@ -82,7 +82,7 @@ class Config:
             bds_container=container,
             data_dir=data_dir,
             # o bot roda em outro container: quem responde e o bds pelo nome DNS
-            # dele na rede "proxy". So sobrescreva se um proxy UDP ficar na frente.
+            # dele na rede do compose. So sobrescreva para apontar para outro host.
             bds_host=os.getenv("BDS_HOST", "").strip() or container,
             bds_port=_int("BDS_PORT", 19132),
             # precisa bater com o LEVEL_NAME do container do jogo: e assim que

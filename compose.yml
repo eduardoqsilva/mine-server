@@ -1,15 +1,5 @@
 name: mine-bedrock
 
-# A rede "proxy" (172.23.0.0/16) ja existe na VPS e e o unico caminho de entrada:
-# o container nginx e o unico com portas publicadas. Com transport=nethernet
-# sao duas, porque o protocolo tem duas etapas:
-#   - TCP 19132    signalling HTTP, o handshake em si
-#   - UDP 19133-72 gameplay WebRTC, faixa fixada por server-udp-ports
-# Ver nginx/stream.d/minecraft.conf. O bds nao publica nada.
-networks:
-  proxy:
-    external: true
-
 services:
   bds:
     image: itzg/minecraft-bedrock-server:stable
@@ -61,13 +51,20 @@ services:
       # abaixo cobre o caso do SIGKILL.
       STOP_SERVER_ANNOUNCE_DELAY: "0"
       OPS: "${OPS:-}"
+    ports:
+      # Sem proxy na frente: o container publica direto no host. Com
+      # transport=nethernet sao duas portas, porque o protocolo tem duas etapas:
+      #   - TCP 19132    signalling HTTP, o handshake em si
+      #   - UDP 19133-72 gameplay WebRTC, faixa fixada por server-udp-ports
+      # A faixa UDP tem que bater com a do data/server.properties
+      # (server-udp-ports=19133-19172:19133-19172).
+      - "19132:19132/tcp"
+      - "19133-19172:19133-19172/udp"
     volumes:
       - ./data:/data
       # O BDS ignora este arquivo (Bedrock nao tem icone de servidor proprio),
       # mas fica montado para o caso de um dia rodar Geyser/Java na frente.
       - ./assets/server-icon.png:/data/server-icon.png:ro
-    networks:
-      - proxy
 
   bot:
     build:
@@ -77,6 +74,8 @@ services:
     restart: unless-stopped
     # mesmo uid/gid do bds: senao o bot cria arquivos no /data que o BDS nao consegue reescrever
     user: "${PUID:-1000}:${PGID:-1000}"
+    group_add:
+      - "989"
     env_file:
       - .env
     environment:
@@ -96,7 +95,5 @@ services:
       # leitura, que nao entram em nenhum comando de docker. O bot nao expoe
       # porta nenhuma e so conversa com o Telegram.
       - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - proxy
     depends_on:
       - bds

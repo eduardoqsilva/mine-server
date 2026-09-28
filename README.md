@@ -7,29 +7,26 @@ e remove packs (.mcaddon/.mcpack).
 ```
 Telegram ──> bot (docker.sock) ──> /data/behavior_packs, /data/resource_packs
                                           │
-Jogadores ──TCP 19132 + UDP 19133-72──> nginx ──┴──> mine-bedrock (VERSION=LATEST)
+Jogadores ──TCP 19132 + UDP 19133-72────────────────────> mine-bedrock (VERSION=LATEST)
 ```
 
-- `bds`: `itzg/minecraft-bedrock-server:stable` com `VERSION=LATEST`. Nao
-  publica porta nenhuma.
+- `bds`: `itzg/minecraft-bedrock-server:stable` com `VERSION=LATEST`. Publica
+  direto no host as duas etapas do nethernet: `TCP 19132` (signalling) e
+  `UDP 19133-19172` (gameplay). Nao ha proxy no meio.
 - `bot`: Python + aiogram, fala com o Docker pelo socket, faz o restart
   diario as 05:00 e responde so a quem tem o codigo de resgate (admin) ou uma
   chave de leitura.
-- `nginx`: (fora deste repo, em `/home/ubuntu/docker/nginx`) encaminha as duas
-  etapas do nethernet: `TCP 19132` (signalling) e `UDP 19133-19172` (gameplay).
-  Ver `nginx/README.md`.
 
 ## Estrutura
 
 ```
-compose.yml            bds + bot, rede externa "proxy"
+compose.yml            bds + bot
 .env.example           copie para .env e preencha
 data/                  mundo, packs e config do BDS (crie antes de subir)
 state/bot.db           usuarios, chaves, config salva e auditoria do bot
 assets/server-icon.png  icone (Bedrock nao usa; o bot manda no /status)
 bot/app/               codigo do bot
 tools/selftest.py      testes da logica pura (nao precisa de Docker)
-nginx/                 o que voce precisa mexer no nginx da VPS
 ```
 
 ## Instalar
@@ -95,10 +92,11 @@ Regras que o bot aplica:
 
 ## Conectar ao servidor
 
-1. `nginx/README.md` - encaminhar `19132/tcp` e a faixa `19133-19172/udp` no
-   nginx da VPS. A faixa tem que bater com o `server-udp-ports` do `data/server.properties`.
-2. Liberar `19132/tcp` e `19133-19172/udp` no firewall da maquina e no painel do
-   provedor. No UFW sao 2 comandos, porque faixa e uma regra so:
+1. O `compose.yml` ja publica `19132/tcp` e a faixa `19133-19172/udp` direto no
+   container do jogo. A faixa tem que bater com o `server-udp-ports` do
+   `data/server.properties`; se mudar la, mude no compose tambem.
+2. Liberar as duas no firewall da maquina e no painel do provedor. No UFW sao 2
+   comandos, porque faixa e uma regra so:
    `ufw allow 19132/tcp` e `ufw allow 19133:19172/udp`
 3. No Cloudflare, o registro do jogo fica **so DNS (cinza)**.
 
@@ -110,8 +108,7 @@ Os jogadores entram em **Adicionar servidor -> Endereço -> `seu.dominio`**.
 > `Accepting clients on [::]:19132`), e so depois negocia por **UDP** o trafego
 > de jogo via WebRTC. Como essa segunda etapa sorteia portas efemeras do
 > sistema, atras de NAT ela nao funciona sem faixa fixa - e o que o
-> `server-udp-ports=19133-19172:19133-19172` resolve. Em LAN nao precisa disso
-> nenhum: e por isso que o teste local na propria rede funciona mesmo sem proxy.
+> `server-udp-ports=19133-19172:19133-19172` resolve.
 
 ## Sobre o icone
 
@@ -241,12 +238,11 @@ pela de dentro:
 ```bash
 # 1. o BDS responde o signalling TCP?
 docker exec mine-bedrock sh -c 'printf "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" | nc 127.0.0.1 19132'
-# 2. o nginx repassou?
-docker exec nginx sh -c 'printf "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" | nc 127.0.0.1 19132'
-# 3. as portas estao abertas na VPS?
-docker exec nginx netstat -lnt | grep 19132     # 1 linha
-docker exec nginx netstat -lnu | grep -c 191   # 40 linhas
-# 4. o gameplay usou a faixa fixa? (so com alguem conectado)
+# 2. as portas estao publicadas no host?
+docker compose port bds 19132
+netstat -an | findstr 19132
+netstat -an | findstr ":191 "   # 40 linhas de UDP, 19133-19172
+# 3. o gameplay usou a faixa fixa? (so com alguem conectado)
 docker exec mine-bedrock sh -c "awk '{print \$2}' /proc/net/udp6"
 ```
 
@@ -255,9 +251,9 @@ Sintoma por etapa:
 | o que voce ve | causa provavel |
 | --- | --- |
 | passo 1 nao responde | o BDS nao subiu, ou `server-port` mudou |
-| passo 1 responde, passo 2 nao | o bloco `stream` do nginx nao esta carregando |
-| passo 2 responde, jogo trava ao spawnar | **falta a faixa UDP**: `server-udp-ports` vazio, nginx sem o `listen ... udp`, ou firewall/ingress do provedor bloqueando 19133-19172 |
-| passo 4 mostra porta efemera (`7FFE` etc) | `server-udp-ports` nao foi honrado; o gameplay nunca passa pelo proxy |
+| passo 1 responde, mas da rede nao conecta | porta nao publicada, ou firewall/ingress do provedor bloqueando |
+| a rede conecta e o jogo trava ao spawnar | **falta a faixa UDP**: `server-udp-ports` vazio ou divergente da faixa publicada, ou o firewall bloqueando 19133-19172 |
+| passo 3 mostra porta efemera (`7FFE` etc) | `server-udp-ports` nao foi honrado; o gameplay sorteia porta e morre atras de NAT |
 | tudo acima ok e o jogo nao entra | DNS/Cloudflare: o registro tem que ser **cinza** |
 
 Nao use `mc-monitor` para diagnosticar: ele faz ping raknet e o nethernet nao

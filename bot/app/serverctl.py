@@ -66,7 +66,7 @@ CATALOGO: tuple[Prop, ...] = (
         "server-port",
         "Porta do jogo",
         "int",
-        cuidado="o nginx so encaminha a 19132: mudar isso derruba o acesso ate voce mudar o nginx tambem",
+        cuidado="o compose publica 19132/tcp: mudar isso derruba o acesso ate voce mudar o compose tambem",
     ),
     Prop("level-name", "Nome da pasta do mundo", "str", cuidado="so vale no primeiro boot; depois e preciso mover a pasta"),
     Prop("online-mode", "Autenticacao Microsoft", "bool", cuidado="desligar quebra o permissions.json (precisa de XUID)"),
@@ -75,8 +75,8 @@ CATALOGO: tuple[Prop, ...] = (
         "Faixa UDP do nethernet",
         "portas",
         cuidado=(
-            "atras de nginx/firewall o nethernet so conecta com faixa fixa: "
-            "o externo tem que bater com a porta publicada no proxy. "
+            "atras de firewall o nethernet so conecta com faixa fixa: "
+            "o externo tem que bater com a faixa publicada no compose. "
             "Vazio volta a usar as portas efemeras e so funciona em LAN"
         ),
     )
