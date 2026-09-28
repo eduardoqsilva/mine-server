@@ -11,6 +11,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from types import MethodType, SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bot"))
 
@@ -43,8 +44,36 @@ if "aiogram" not in sys.modules:
         sys.modules["aiogram"] = falso
         sys.modules["aiogram.types"] = tipos
 
+if "docker" not in sys.modules:
+    try:  # docker so existe no container; aqui a gente testa logica pura
+        import docker  # noqa: F401
+    except ImportError:
+        import types
+
+        falso = types.ModuleType("docker")
+
+        class DockerException(Exception):
+            pass
+
+        class APIError(DockerException):
+            pass
+
+        class NotFound(DockerException):
+            pass
+
+        erros = types.ModuleType("docker.errors")
+        erros.DockerException = DockerException
+        erros.APIError = APIError
+        erros.NotFound = NotFound
+        falso.errors = erros
+        falso.__path__ = []
+        sys.modules["docker"] = falso
+        sys.modules["docker.errors"] = erros
+
 from app import addons  # noqa: E402
 from app import auth  # noqa: E402
+from app import docker_ctl  # noqa: E402
+from app import ops  # noqa: E402
 from app import raknet  # noqa: E402
 from app import serverctl  # noqa: E402
 from app import store  # noqa: E402
@@ -663,8 +692,239 @@ def test_interpreta_config() -> None:
     check("fluxo completo aplica", (chave, valor) == ("level-seed", "abc") and not conf(serverctl.POR_CHAVE[chave], ok))
 
 
+def test_config_persiste() -> None:
+    """O /config tem que sobreviver ao boot do container e ao recreate do bot.
+
+    A config vive em dois lugares ao mesmo tempo: o /data/server.properties (o
+    que o BDS le) e a tabela overrides do bot.db (a memoria do bot). O boot
+    reescreve o arquivo, entao a unica coisa que faz a config voltar e o
+    reconciliador, que compara os dois e reaplica o que divergiu.
+    """
+    print("config: o que o bot grava sobrevive ao boot e ao recreate")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        data = tmp / "data"
+        data.mkdir()
+        props = data / "server.properties"
+        padrao = "server-name=Revolucao\ndifficulty=easy\nmax-players=10\n"
+        props.write_text(padrao, encoding="utf-8")
+        db = tmp / "state" / "bot.db"
+
+        srv = serverctl.ServerControl(data)
+        st = store.Store(db)
+        ctx = SimpleNamespace(store=st, server=srv)
+
+        # o que o /config difficulty hard faz: arquivo + banco
+        valor = serverctl.valida(serverctl.POR_CHAVE["difficulty"], "hard")
+        srv.set_prop("difficulty", valor)
+        st.set_override("difficulty", valor, 42)
+        check("gravou no server.properties", srv.le_props()["difficulty"] == "hard", srv.le_props())
+        check("gravou no bot.db", st.overrides() == {"difficulty": "hard"}, st.overrides())
+        check("sem drift logo apos gravar", ops.overrides_sujo(ctx) == [])
+
+        # o boot reescreve o arquivo com o padrao da imagem
+        props.write_text(padrao, encoding="utf-8")
+        drift = ops.overrides_sujo(ctx)
+        check("drift detectado depois do boot", drift == [("difficulty", "hard", "easy")], drift)
+
+        reaplicados = ops.aplica_overrides(ctx)
+        check("reconciliador reaplicou", reaplicados == ["difficulty=hard"], reaplicados)
+        check("arquivo corrigido", srv.le_props()["difficulty"] == "hard", srv.le_props())
+        check("so o que divergiu foi tocado", srv.le_props()["server-name"] == "Revolucao", srv.le_props())
+        check("reconciliador e idempotente", ops.aplica_overrides(ctx) == [] and ops.overrides_sujo(ctx) == [])
+
+        # o bot foi recriado (docker compose up -d --build): o .db continua
+        st.fecha()
+        st2 = store.Store(db)
+        srv2 = serverctl.ServerControl(data)
+        ctx2 = SimpleNamespace(store=st2, server=srv2)
+        check("override sobrevive ao recreate", st2.overrides() == {"difficulty": "hard"}, st2.overrides())
+
+        props.write_text(padrao, encoding="utf-8")
+        check("reaplicou depois do recreate", ops.aplica_overrides(ctx2) == ["difficulty=hard"])
+        check("valor final correto", srv2.le_props()["difficulty"] == "hard", srv2.le_props())
+        st2.fecha()
+
+        # backup: um por gravacao, sem colidir, e podado no limite
+        nomes = [p.name for p in sorted(data.glob("server.properties.*.bak"))]
+        check("um backup por gravacao", len(nomes) == 3, nomes)
+        check("sem colisao de carimbo no mesmo segundo", len(set(nomes)) == 3, nomes)
+        primeiro = min(data.glob("server.properties.*.bak"))
+        check("cada backup tem o conteudo anterior", "difficulty=easy" in primeiro.read_text(encoding="utf-8"))
+
+        # agora com backup_keep=2: os mais velhos caem fora
+        srv = serverctl.ServerControl(data, backup_keep=2)
+        srv.set_prop("difficulty", "normal")
+        srv.set_prop("difficulty", "hard")
+        srv.set_prop("difficulty", "easy")
+        check(
+            "server.properties podado no backup_keep",
+            len(list(data.glob("server.properties.*.bak"))) == 2,
+            [p.name for p in data.glob("server.properties.*.bak")],
+        )
+
+        # allowlist/permissions tambem fazem backup, e tambem sao podados
+        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
+        for i in range(5):
+            srv.add_allowlist(f"Jogador{i}")
+        check(
+            "backup de allowlist tambem e podado",
+            len(list(data.glob("allowlist.json.*.bak"))) == 2,
+            [p.name for p in data.glob("allowlist.json.*.bak")],
+        )
+        check("allowlist continua valida", len(srv.allowlist()) == 5, srv.allowlist())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_console() -> None:
+    """O /console manda no BDS e devolve so a resposta, nao o log inteiro."""
+    print("console: leitura da resposta do BDS")
+    from docker.errors import APIError
+
+    # --- apresentacao: o que o admin ve no Telegram ---
+    # As linhas abaixo estao no formato que o container really printa
+    # ("[data hora:ms NIVEL] texto", com o nivel dentro do colchete).
+    linhas = [
+        "[2026-09-28 16:41:38:198 INFO] [Command] list",
+        "[2026-09-28 16:45:00:124 INFO] There are 2 of a max of 10 players online:",
+        "[2026-09-28 16:45:00:125 INFO] Ze, 1.2.3.4",
+        "[2026-09-28 16:45:00:125 INFO] Ze, 1.2.3.4",
+        "",
+        "[2026-09-28 16:45:00:126 INFO] ",
+    ]
+    saida = ops.resposta_console("list", linhas)
+    check("tira o carimbo com nivel dentro", "2026-09-28 16:45" not in saida, saida)
+    check("tira o eco do comando", not any(linha.strip() == "list" for linha in saida.splitlines()), saida)
+    check("tira linha repetida", saida.count("Ze, 1.2.3.4") == 1, saida)
+    check("tira linha vazia", "There are 2" in saida, saida)
+    # formato antigo: data num colchete e a tag [Server] em outro
+    check(
+        "formato antigo tambem e limpo",
+        ops.limpa_linha_console("[2026-09-28 12:00:00:001 UTC] [Server] [Command] tps") == "tps",
+        ops.limpa_linha_console("[2026-09-28 12:00:00:001 UTC] [Server] [Command] tps"),
+    )
+    check("guarda a severidade", ops.limpa_linha_console("[2026-09-28 12:00:00:001 UTC] [Error] boom") == "[Error] boom")
+    check("diz que nao veio nada", "nao devolveu nada" in ops.resposta_console("save-resume", []))
+    longo = ops.resposta_console("help", [f"[2026-09-28 16:45:00:1 INFO] comando numero {i} " + "x" * 60 for i in range(60)])
+    check("resposta longa e cortada pelo fim", "... (inicio cortado)" in longo and len(longo) < 3600, len(longo))
+
+    # --- a janela de log: e o que garante que a resposta seja a nova ---
+    class _Fake:
+        """DockerController sem Docker: logs e exec controlada a mao."""
+
+        def __init__(self, antes: list[str], depois: list[str], erro: bool = False, recusa: str = "") -> None:
+            self._linhas = list(antes)
+            self._depois = list(depois)
+            self._erro = erro
+            self._recusa = recusa
+            self.comandos: list[tuple[str, ...]] = []
+            self.console = MethodType(docker_ctl.DockerController.console, self)
+
+        def logs(self, lines: int = 200, since: float | None = None) -> str:
+            return "\n".join(self._linhas[-lines:])
+
+        def exec(self, *args: str) -> str:
+            self.comandos.append(args)
+            if self._erro:
+                raise APIError("container parado")
+            if self._recusa:
+                return self._recusa
+            # o comando que entrou no console aparece no log
+            self._linhas = self._linhas + self._depois
+            return ""
+
+    velhas = ["[2026-09-28 16:41:38:198 INFO] Server started."]
+    novas = [
+        "[2026-09-28 16:45:00:123 INFO] [Command] list",
+        "[2026-09-28 16:45:00:124 INFO] There are 1 of a max of 10 players online:",
+    ]
+    fake = _Fake(velhas, novas)
+    erro, resposta = fake.console("list", espera=0.4, teto=25)
+    check("manda pelo send-command", fake.comandos == [("send-command", "list")], fake.comandos)
+    check("entregue sem erro", erro == "", erro)
+    check("devolve so as linhas novas", resposta == novas, resposta)
+    check("nao devolve o log antigo", not any("Server started" in linha for linha in resposta), resposta)
+
+    fake = _Fake(velhas, novas, erro=True)
+    erro, resposta = fake.console("list", espera=0.4)
+    check("erro do docker nao levanta", bool(erro) and resposta == [], (erro, resposta))
+
+    # o send-command recusou (nao achou o processo): tem que dizer, nao fingir
+    # que o console ficou mudo. A recusa abaixo e a saida real do container.
+    recusa = (
+        "find: '/proc/1/exe': Permission denied\n"
+        "find: '/proc/12/exe': Permission denied\n"
+        "ERROR: failed to search for bedrock server process"
+    )
+    fake = _Fake(velhas, novas, recusa=recusa)
+    erro, resposta = fake.console("list", espera=0.4)
+    check("recusa do send-command e erro, nao silencio", bool(erro) and resposta == [], (erro, resposta))
+    saida = ops.resposta_console("list", resposta, erro)
+    check("admin ve que nao chegou", "nao chegou no console" in saida, saida)
+    check("motivo do /proc eh o do Docker Desktop", "Docker Desktop" in erro, erro)
+    check(
+        "motivo do processo ausente nao fala de Windows",
+        "Docker Desktop" not in docker_ctl._motivo_recusa("ERROR: unable to find bedrock server process"),
+        docker_ctl._motivo_recusa("ERROR: unable to find bedrock server process"),
+    )
+
+    # comando sem resposta: espera o tempo todo e devolve vazio
+    fake = _Fake(velhas, [])
+    erro, resposta = fake.console("save-resume", espera=0.4)
+    check("comando mudo devolve vazio", erro == "" and resposta == [], (erro, resposta))
+
+    # rotacao de log encolhe a janela: melhor nao devolver nada do que mentir
+    fake = _Fake(velhas, [])
+    fake._linhas = ["so uma linha"]
+    erro, resposta = fake.console("tps", espera=0.4)
+    check("rotacao de log nao inventa linha", resposta == [], resposta)
+
+    # teto: help despeja muita coisa e o Telegram tem limite
+    fake = _Fake(velhas, [f"linha {i}" for i in range(50)])
+    erro, resposta = fake.console("help", espera=0.4, teto=5)
+    check("respeita o teto de linhas", len(resposta) == 5, len(resposta))
+
+    # --- o caso que so aparece com o servidor de verdade ---
+    # `docker logs --tail=500` devolve SEMPRE 500 linhas num log com mais de
+    # 500, entao comparar contagem nunca acha nada. A ancora tem que ser pelo
+    # conteudo, e este e o teste que pega a regressao.
+    check(
+        "log cheio nao esconde a resposta",
+        docker_ctl._delta(["velha"] * 500, ["velha"] * 498 + novas) == novas,
+        docker_ctl._delta(["velha"] * 500, ["velha"] * 498 + novas),
+    )
+    fake = _Fake(["velha"] * 500, novas)
+    erro, resposta = fake.console("list", espera=0.4)
+    check("resposta no log cheio", resposta == novas, len(resposta))
+    check("log cheio nao devolve o historico", all("velha" not in linha for linha in resposta), resposta[:2])
+
+    # linhas repetidas: a ancora tem que casar pelo maior pedaco, senao a
+    # resposta repete a ultima linha do log antigo
+    check(
+        "ancora acha a maior sobreposicao",
+        docker_ctl._delta(["A", "B", "B"], ["A", "B", "B", "C"]) == ["C"],
+        docker_ctl._delta(["A", "B", "B"], ["A", "B", "B", "C"]),
+    )
+    check("sem sobreposicao nao inventa", docker_ctl._delta(["A", "B"], ["X", "Y"]) == [])
+    check("log vazio antes devolve tudo", docker_ctl._delta([], ["A"]) == ["A"])
+    check("nada novo devolve vazio", docker_ctl._delta(["A", "B"], ["A", "B"]) == [])
+
+
 if __name__ == "__main__":
-    for teste in (test_detect_mcaddon, test_nome_de_traducao, test_zip_slip, test_apply_update, test_raknet, test_store, test_auth, test_serverctl, test_interpreta_config):
+    for teste in (
+        test_detect_mcaddon,
+        test_nome_de_traducao,
+        test_zip_slip,
+        test_apply_update,
+        test_raknet,
+        test_store,
+        test_auth,
+        test_serverctl,
+        test_interpreta_config,
+        test_config_persiste,
+        test_console,
+    ):
         teste()
     print()
     if falhas:

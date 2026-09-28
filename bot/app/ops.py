@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,6 +63,72 @@ def aplica_overrides(ctx: AppContext) -> list[str]:
         ctx.server.set_prop(chave, valor)
         reaplicados.append(f"{chave}={valor}")
     return reaplicados
+
+
+# O BDS escreve "[2026-09-28 16:41:21:830 INFO] texto" - o nivel vai DENTRO do
+# colchete, e por isso some junto com o carimbo. O formato antigo trazia
+# "[2026-09-28 12:00:00:123 UTC] [Server] texto", e o regex abaixo pega os dois:
+# qualquer colchete inicial que comece com data. As tags [Server]/[Command] vem
+# depois, em linha separada, e sao removidas a parte; [Error] e companhia
+# ficam, porque ali a severidade e a informacao.
+RE_CARIMBO = re.compile(r"^\s*\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*")
+TAGS_MUROS = ("[Server]", "[Server:Console]", "[Console]", "[Command]", "[Chat]", "[Scripting]")
+
+
+def limpa_linha_console(linha: str) -> str:
+    texto = RE_CARIMBO.sub("", linha).strip()
+    # As tags podem vir empilhadas ("[Server] [Command] list"), entao o corte
+    # e em loop: parar na primeira deixaria "[Command] list" no meio da
+    # resposta, e o filtro de eco nao pegaria.
+    trocou = True
+    while trocou:
+        trocou = False
+        for tag in TAGS_MUROS:
+            if texto.startswith(tag):
+                texto = texto[len(tag) :].strip()
+                trocou = True
+                break
+    return texto
+
+
+def resposta_console(comando: str, linhas: list[str], erro: str = "", limite: int = 3500) -> str:
+    """Monta a resposta do console para o Telegram.
+
+    Filtra o eco do proprio comando (o BDS devolve "[Command] list" no log) e
+    linhas repetidas, que alguns comandos geram a cada jogador listado.
+    """
+    cabecalho = txt.cabecalho(txt.CONSOLE, f"console: {comando}")
+    if erro:
+        return "\n".join([cabecalho, "", txt.erro("O comando nao chegou no console."), "", txt.sub([erro])])
+
+    corpo: list[str] = []
+    for bruta in linhas:
+        limpa = limpa_linha_console(bruta)
+        if not limpa or limpa.lower() == comando.lower():
+            continue
+        if corpo and limpa == corpo[-1]:
+            continue
+        corpo.append(limpa)
+
+    if not corpo:
+        return "\n".join(
+            [
+                cabecalho,
+                "",
+                txt.info("O console nao devolveu nada."),
+                "",
+                txt.sub(
+                    [
+                        "Comandos como 'list', 'help', 'tps' e 'gamerule' respondem.",
+                        "Os que nao falam nada (save-resume, stop) sao assim mesmo.",
+                    ]
+                ),
+            ]
+        )
+    texto = "\n".join(corpo)
+    if len(texto) > limite:
+        texto = "... (inicio cortado)\n" + texto[-(limite - 24) :]
+    return f"{cabecalho}\n\n{texto}"
 
 
 def _fmt_uptime(started_at: str) -> str:

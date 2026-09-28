@@ -61,6 +61,7 @@ AJUDA_ADMIN = "\n".join(
             [
                 "/reiniciar [motivo]  - reinicia o servidor",
                 "/anunciar <texto>  - fala no chat do jogo",
+                "/console <comando>  - comando no console do BDS, com a resposta",
                 "/log [n]  - ultimas linhas do log",
                 "/auditoria  - ultimas acoes registradas",
             ]
@@ -586,6 +587,44 @@ async def cmd_anunciar(message: Message, command: CommandObject, ctx: AppContext
     await asyncio.to_thread(ctx.docker.say, texto)
     ctx.store.audita(message.from_user.id, "anunciar", texto[:120])
     await message.answer(txt.ok(f"Falei no jogo: {texto}"))
+
+
+@router.message(Command("console", "cmd", "comando"))
+async def cmd_console(message: Message, command: CommandObject, ctx: AppContext) -> None:
+    """Manda um comando no console do BDS e mostra a resposta na mesma mensagem.
+
+    Escapa de rotas que ainda nao existem no bot: qualquer palavra que o BDS
+    aceite ('gamerule', 'tps', 'time set day', 'whitelist on') vai direto. E a
+    unica forma de mexer em algo que o catalogo do /config nao cobre.
+    """
+    texto = (command.args or "").strip()
+    if not texto:
+        await message.answer(
+            "\n".join(
+                [
+                    txt.info("Uso: /console <comando>"),
+                    "",
+                    txt.sub(
+                        [
+                            "/console list",
+                            "/console help",
+                            "/console tps",
+                            "/console gamerule doDaylightCycle false",
+                        ]
+                    ),
+                ]
+            )
+        )
+        return
+    estado = await asyncio.to_thread(ctx.docker.state)
+    if not estado.running:
+        await message.answer(
+            txt.erro("O container do BDS nao esta rodando, entao nao ha console.")
+        )
+        return
+    erro, linhas = await asyncio.to_thread(ctx.docker.console, texto)
+    ctx.store.audita(message.from_user.id, "console", texto[:120])
+    await message.answer(_clip(ops.resposta_console(texto, linhas, erro)))
 
 
 LOG_LIMITE = 3700

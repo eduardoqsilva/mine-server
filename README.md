@@ -152,6 +152,7 @@ tela de packs do cliente.
 | `/pessoas` | quem tem acesso ao bot |
 | `/reiniciar [motivo]` | reinicia o servidor (com aviso no jogo) |
 | `/anunciar <texto>` | fala no chat do jogo |
+| `/console <comando>` | manda um comando no console do BDS e devolve a resposta |
 | `/log [n]` | ultimas linhas do log (padrao 60, max 1000) |
 | `/auditoria` | ultimas acoes registradas no banco |
 | `/packs` | packs instalados |
@@ -160,6 +161,25 @@ tela de packs do cliente.
 O `/removerpack` sem argumento mostra a lista; clicar num pack ainda pede
 confirmacao, e a remocao reinicia o servidor uma unica vez.
 
+**Sobre o `/console`**: e a vala de escape do `/config`. Qualquer palavra que o
+BDS aceite vai direto pro console — `list`, `help`, `tps`,
+`gamerule doDaylightCycle false`, `time set day`, `whitelist on`.
+
+```
+/console list
+/console tps
+/console gamerule doFireTick false
+```
+
+Como funciona: o `send-command` da imagem nao e um cliente de console, ele
+escreve o comando no stdin do processo (`/proc/<pid>/fd/0`) e sai sem responder
+nada. A resposta sai no stdout do container, ou seja, no log. Por isso o bot
+conta as linhas do log antes de mandar, espera a resposta parar de crescer (ate
+3s) e devolve so as linhas novas, sem o carimbo de tempo e sem o eco do proprio
+comando. Comando que nao fala nada (`save-resume`, `stop`) espera os 3s e
+responde "o console nao devolveu nada" — isso e o comando funcionando, nao
+falha. Para derrubar o servidor use `/reiniciar`, que avisa o jogo antes.
+
 **Sobre "negar"**: o Bedrock nao tem lista de bloqueio. O que o bot faz e tirar o
 jogador da allow-list, mandar `kick` e guardar o nome como negado (o `/permitir`
 recusa ate voce usar `/permitido`). Com a allow-list ligada, isso bloqueia o
@@ -167,12 +187,25 @@ jogador de verdade. **Com a allow-list desligada, negar nao impede nada** - o
 bot avisa e sugere `/config allow-list true`.
 
 **Sobre as propriedades**: quem manda e o bot. Ele escreve em
-`/data/server.properties` e guarda o valor tambem no `state/bot.db`, para
-reaplicar depois de um boot ou de uma atualizacao da imagem (que reescreve o
-arquivo). Por isso o `compose.yml` **nao** passa `GAMEMODE`, `DIFFICULTY`,
-`MAX_PLAYERS`, `VIEW_DISTANCE`, `SERVER_NAME`, `ALLOW_LIST` nem
-`DEFAULT_PLAYER_PERMISSION_LEVEL` para o container: variavel de ambiente ganha
-a ultima palavra no boot. Mudou algo no `.env`? Mude pelo `/config` tambem.
+`/data/server.properties` **e** guarda o valor na tabela `overrides` do
+`state/bot.db`. Sao duas camadas de proposito: o arquivo e o que o BDS le, e o
+`bot.db` e a memoria do bot, que sobrevive a um `docker compose up -d --build`.
+A cada 60s o `reconciliador` compara os dois e reescreve no arquivo o que
+divergiu, entao o que o admin gravou no Telegram nao se perde.
+
+A imagem **nao** reescreve o `server.properties` inteiro: o `bedrock-entry.sh`
+so passa para o arquivo as propriedades que tem variavel de ambiente
+**setada** (`set-property --bulk`), e o que nao tem fica como o bot deixou.
+Por isso o `compose.yml` nao passa `GAMEMODE`, `DIFFICULTY`, `MAX_PLAYERS`,
+`VIEW_DISTANCE`, `SERVER_NAME`, `ALLOW_LIST` nem
+`DEFAULT_PLAYER_PERMISSION_LEVEL`: se passasse, a variavel de ambiente
+ganharia a ultima palavra no boot. Mudou algo no `.env`? Mude pelo `/config`
+tambem.
+
+A unica excecao e o **`level-name`**: o `LEVEL_NAME` do compose e o que escolhe
+`worlds/<nome>` e o que escreve `level-name` no arquivo, entao la quem manda e o
+compose. O `/config level-name` avisa e grava do mesmo jeito, mas so vale depois
+de mudar o `LEVEL_NAME` e mover a pasta do mundo.
 
 Mudancas que o Bedrock so le no boot (dificuldade, distancia de visao, gamemode,
 permissoes) pedem reinicio: o bot faz isso sozinho e avisa. Allow-list e

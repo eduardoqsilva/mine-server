@@ -31,6 +31,7 @@ JOGADORES = "👥"
 CHAVES = "🔑"
 PACOTES = "📦"
 LOG = "📋"
+CONSOLE = "🖥️"
 CONFIG = "⚙️"
 MUNDO = "🌍"
 

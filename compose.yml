@@ -25,16 +25,19 @@ services:
       TZ: "${TZ:-America/Sao_Paulo}"
       # Aviso importante: daqui para baixo estao SO as variaveis de primeira
       # instalacao. Nao coloque aqui gamemode, difficulty, max-players,
-      # view-distance, server-name, allow-list, level-name, white-list ou
-      # default-player-permission-level: o image reescreve
-      # /data/server.properties em todo boot e ganharia a ultima palavra, jogando
-      # fora o que o admin mudou pelo bot (/config no Telegram). O proprio bot
-      # grava em server.properties, que e a fonte da verdade, e reaplica o que
-      # ele guardou no SQLite (/config aplicar ou o reconciliador de 60s).
+      # view-distance, server-name, allow-list, white-list ou
+      # default-player-permission-level.
       #
-      # LEVEL_NAME aqui so serve para criar o mundo no primeiro start, porque o
-      # image escolhe /data/worlds/<LEVEL_NAME>. Depois disso quem manda no nome
-      # da pasta e server.properties, que o bot le.
+      # O image NAO reescreve o /data/server.properties inteiro: o
+      # bedrock-entry.sh so passa para o arquivo as propriedades que tem
+      # variavel de ambiente SETADA (set-property --bulk). Entao o que o bot
+      # grava por /config fica no arquivo, e o que o bot guardou no SQLite
+      # (/state/bot.db) reaparece sozinho pelo reconciliador de 60s.
+      #
+      # A excecao e o LEVEL_NAME: ele e das duas coisas ao mesmo tempo, porque
+      # o entry usa para montar worlds/<LEVEL_NAME> e o set-property escreve
+      # level-name. Quem manda no nome da pasta do mundo e o compose; o bot
+      # avisa isso no /config level-name.
       LEVEL_NAME: "${LEVEL_NAME:-world}"
       # Workaround do bug de pong do Mojang (BDS >= 1.26.30 devolve 33 bytes
       # sem "MCPE;", issue itzg#649). Fuerza o caminho de handshake LAN, que

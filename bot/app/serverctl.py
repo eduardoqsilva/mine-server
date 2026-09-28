@@ -1,9 +1,12 @@
 """Controle do servidor: server.properties, allowlist.json, permissions.json e kicks.
 
-O bot e o dono do /data/server.properties. As variaveis de ambiente do compose
-que brigariam com o arquivo (GAMEMODE, DIFFICULTY...) foram removidas de la
-justamente por isso: se as duas fontes existirem, o container sobrescreve o
-arquivo no boot e a mudanca do Telegram se perde a cada reinicio.
+O bot e o dono do /data/server.properties. O image nao reescreve o arquivo
+inteiro: o bedrock-entry.sh so joga nele as propriedades que tem variavel de
+ambiente SETADA, entao o que o bot grava fica. As variaveis do compose que
+brigariam com o arquivo (GAMEMODE, DIFFICULTY...) foram deixadas de fora de
+proposito, para o /config do Telegram ser a unica fonte. A excecao e
+LEVEL_NAME, que o image usa tambem para escolher a pasta do mundo: la quem
+manda e o compose, e o /config level-name avisa.
 """
 
 from __future__ import annotations
@@ -21,6 +24,24 @@ log = logging.getLogger("bds.server")
 XUID_RE = re.compile(r"\b\d{15,20}\b")
 
 BACKUP_SUFFIX = ".bak"
+
+
+def caminho_backup(caminho: Path) -> Path:
+    """Nome unico de backup: carimbo de segundo + contador de 3 digitos.
+
+    So o carimbo nao bastava: o reconciliador grava varias chaves em sequencia
+    (e o /config pode mandar varias de uma vez) e tudo isso acontece no mesmo
+    segundo. Sem o contador a segunda gravacao sobrescrevia o backup da
+    primeira e o historico do arquivo ficava com buracos. Os 3 digitos sao
+    fixos de proposito: e o que mantem a ordem cronologica quando o prune
+    ordena os backups por nome.
+    """
+    carimbo = int(time.time())
+    for tentativa in range(1000):
+        alvo = caminho.with_suffix(caminho.suffix + f".{carimbo}{tentativa:03d}{BACKUP_SUFFIX}")
+        if not alvo.exists():
+            return alvo
+    raise PropertyError(f"nao consegui achar um nome livre para o backup de {caminho.name}")
 
 
 class PropertyError(ValueError):
@@ -68,7 +89,16 @@ CATALOGO: tuple[Prop, ...] = (
         "int",
         cuidado="o compose publica 19132/tcp: mudar isso derruba o acesso ate voce mudar o compose tambem",
     ),
-    Prop("level-name", "Nome da pasta do mundo", "str", cuidado="so vale no primeiro boot; depois e preciso mover a pasta"),
+    Prop(
+        "level-name",
+        "Nome da pasta do mundo",
+        "str",
+        cuidado=(
+            "o LEVEL_NAME do compose manda nesta: a imagem reescreve level-name "
+            "em todo boot, entao para valer tem que mudar la tambem (e mover a "
+            "pasta do mundo, que o nome so passa a valer no boot seguinte)"
+        ),
+    ),
     Prop("online-mode", "Autenticacao Microsoft", "bool", cuidado="desligar quebra o permissions.json (precisa de XUID)"),
     Prop(
         "server-udp-ports",
@@ -187,6 +217,16 @@ class ServerControl:
         self.allowlist_path = data_dir / "allowlist.json"
         self.permissions_path = data_dir / "permissions.json"
 
+    def _podar_backups(self, caminho: Path) -> None:
+        """Mantem so os backup_keep mais novos de um arquivo.
+
+        Sem isso o /data enche: toda gravacao de allow-list e de permissions
+        deixa um .bak para tras e ninguem limpava.
+        """
+        velhos = sorted(self.data_dir.glob(caminho.name + ".*" + BACKUP_SUFFIX))
+        for velho in velhos[: max(0, len(velhos) - self.backup_keep)]:
+            velho.unlink(missing_ok=True)
+
     # ---------------------------------------------------------- server.properties
 
     def existe_props(self) -> bool:
@@ -207,11 +247,9 @@ class ServerControl:
     def _backup_props(self) -> Path | None:
         if not self.props_path.is_file():
             return None
-        alvo = self.props_path.with_suffix(self.props_path.suffix + f".{int(time.time())}{BACKUP_SUFFIX}")
+        alvo = caminho_backup(self.props_path)
         shutil.copy2(self.props_path, alvo)
-        velhos = sorted(self.data_dir.glob("server.properties.*.bak"))
-        for velho in velhos[: max(0, len(velhos) - self.backup_keep)]:
-            velho.unlink(missing_ok=True)
+        self._podar_backups(self.props_path)
         return alvo
 
     def set_prop(self, chave: str, valor: str) -> tuple[str, str]:
@@ -262,7 +300,8 @@ class ServerControl:
     def _salva_lista(self, caminho: Path, dados: list[dict]) -> None:
         caminho.parent.mkdir(parents=True, exist_ok=True)
         if caminho.is_file():
-            shutil.copy2(caminho, caminho.with_suffix(caminho.suffix + f".{int(time.time())}{BACKUP_SUFFIX}"))
+            shutil.copy2(caminho, caminho_backup(caminho))
+            self._podar_backups(caminho)
         caminho.write_text(json.dumps(dados, indent=2) + "\n", encoding="utf-8")
 
     def allowlist(self) -> list[dict]:
