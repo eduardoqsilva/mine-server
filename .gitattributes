@@ -1,0 +1,5 @@
+# O host/firewall.sh roda no Ubuntu via systemd. Com CRLF o shebang quebra com
+# "bad interpreter: /bin/sh^M" e o servico falha no boot, sem erro legivel no
+# momento do deploy -- so apareceria no proximo reboot. LF e obrigatorio.
+host/*.sh    text eol=lf
+host/*.service text eol=lf

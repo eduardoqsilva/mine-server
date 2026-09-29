@@ -112,6 +112,7 @@ Regras que o bot aplica:
    `data/server.properties`; se mudar la, mude no firewall tambem.
 2. Liberar no firewall da maquina e no painel do provedor. No UFW:
    `ufw allow 19132/tcp`, `ufw allow 7551/udp` e `ufw allow 19133:19172/udp`.
+   Em distro sem UFW, e o caso da OCI, use o `host/firewall.sh` (abaixo).
 3. No Cloudflare, o registro do jogo fica **so DNS (cinza)**.
 
 Os jogadores entram em **Adicionar servidor -> Endereço -> `seu.dominio`**.
@@ -153,6 +154,45 @@ Os jogadores entram em **Adicionar servidor -> Endereço -> `seu.dominio`**.
 > larga nao funcionar, liste portas avulsas:
 > `<IP-PUBLICO>:19133:19133,<IP-PUBLICO>:19134:19134`.
 > E o edge do provedor precisa deixar passar a faixa UDP, senao nao adianta.
+
+### Firewall que sobrevive a reboot
+
+> **Este e' o passo que quase todo mundo pula, e o que mais atrasa.** A imagem
+> Ubuntu da OCI tem um `iptables` local instalado pelo `cloud-init` que so abre
+> `22/80/443` e fecha o `INPUT` com
+> `-A INPUT -j REJECT --reject-with icmp-host-prohibited`. Duas consequencias:
+>
+> 1. Liberar a porta **so na security list da OCI nao resolve**, porque esse
+>    `REJECT` e local e vem antes de tudo.
+> 2. O `cloud-init` roda **uma vez so**. Regra digitada a mao vale ate o proximo
+>    reboot - e a maquina volta a recusar todo mundo sem aviso nenhum.
+>
+> O `ping` da propria maquina ajuda a diferenciar: se `ping -c1 10.0.0.150` responde
+> *Destination Host Unreachable* em vez de perder, o bloqueio e local, nao do
+> edge.
+
+Como o `ufw` nao vem na imagem, use o script do repo:
+
+```bash
+sudo mkdir -p /opt/mine-bedrock
+sudo cp host/firewall.sh host/mine-bedrock-firewall.service /opt/mine-bedrock/
+sudo sh /opt/mine-bedrock/firewall.sh          # ja abre, pode rodar agora
+sudo cp /opt/mine-bedrock/mine-bedrock-firewall.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now mine-bedrock-firewall
+```
+
+Para conferir depois de um reboot:
+
+```bash
+systemctl is-enabled mine-bedrock-firewall   # esperado: enabled
+sudo iptables -L INPUT -n | grep -E 'dpt:19132|dpts:19133:19172|dpt:7551'
+```
+
+O script e' idempotente e so faz `iptables -C` e `-I`: nunca apaga regra alheia,
+nem mexe na `DOCKER-USER` (que nem entra no caminho, ja que o `bds` esta em
+rede host). Se mudar a faixa no `server-udp-ports`, atualize o `UDP_PORTS` do
+servico junto, senao os dois voltam a divergir.
 
 ## Sobre o icone
 
@@ -428,6 +468,8 @@ curl -s http://127.0.0.1:19132/v1/join
 docker inspect -f '{{.HostConfig.NetworkMode}}' mine-bedrock
 # 3. as portas estao abertas no firewall da maquina?
 ss -lntup | grep -E ':(19132|7551|1913[3-9]|19[1-6][0-9]|1917[0-2])\b'
+# 3b. o INPUT local esta rejecting antes de chegar no bds? (o-classico da OCI)
+sudo iptables -L INPUT -n --line-numbers
 # 4. o gameplay usou a faixa fixa? (so da pra ver com alguem conectando)
 docker exec mine-bedrock sh -c "awk '{print \$2}' /proc/net/udp6"
 ```
@@ -438,10 +480,12 @@ Sintoma por etapa:
 | --- | --- |
 | passo 1 nao responde | o BDS nao subiu, ou `server-port` mudou |
 | passo 1 responde, mas da rede nao conecta | `19132/tcp` fechada no firewall/ingress do provedor |
+| `ping -c1` responde *Host Unreachable* | o `REJECT icmp-host-prohibited` do cloud-init da OCI esta barrando localmente; a porta aberta no painel nao adianta. Use `host/firewall.sh` |
 | `NetworkMode` do container != `host` | volte ao `compose.yml`: em bridge o nethernet anuncia o IP privado do container e nenhum ajuste de porta resolve |
 | a rede conecta e o jogo trava ao spawnar | **falta a faixa UDP**: `server-udp-ports` vazio ou divergente da faixa liberada, ou o firewall bloqueando 19133-19172 |
 | passo 4 mostra porta efemera (`7FFE` etc) | `server-udp-ports` nao foi honrado; o gameplay sorteia porta e morre atras de NAT |
-| so da rede local funciona, de fora nao | deve ser NAT/ingress do provedor: teste com `SERVER_IP=<ip-publico>` no `.env` |
+| so da rede local funciona, de fora nao | NAT/ingress do provedor: ajuste o `server-udp-ports` para o IP publico. **Nao** mexa no `server-ip` (e' bind, e nao valor anunciado) |
+| so funciona local e quebra de novo apos reboot | regra de `iptables` digitada a mao: o cloud-init da OCI reescreve o `INPUT`. Instale o `mine-bedrock-firewall.service` |
 | tudo acima ok e o jogo nao entra | DNS/Cloudflare: o registro tem que ser **cinza** (Cloudflare nao proxya UDP) |
 
 Duas regras do `server-udp-ports` que valem no BDS 1.26.51+, e que nao dao erro

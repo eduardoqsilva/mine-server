@@ -1,0 +1,23 @@
+[Unit]
+Description=Abre no INPUT as portas do Minecraft Bedrock (nethernet)
+Documentation=file:///opt/mine-bedrock/firewall.sh
+# As regras precisam de interface de rede ja de pe para valerem; sem isso o
+# oneshot roda cedo demais e o boot passa com o INPUT ainda fechado.
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# /bin/sh explicito: ExecStart direto exige bit de exec, que nem sempre
+# sobrevive a um checkout. Assim o servico nao quebra por causa do modo do
+# arquivo, e o erro de digitacao de porta aparece em journalctl, nao em silêncio.
+ExecStart=/bin/sh /opt/mine-bedrock/firewall.sh
+
+# O script so tem iptables -C e -I; se falhar, o problema e de digitacao de
+# porta e vale travar o servico em vez de seguir subindo sem firewall.
+ExecStartPost=-/usr/bin/logger -t mine-bedrock-firewall "portas do nethernet aplicadas"
+
+[Install]
+WantedBy=multi-user.target

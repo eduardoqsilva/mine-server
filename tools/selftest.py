@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -1381,6 +1382,68 @@ def test_ops_backup() -> None:
         ops.espera_pronto = original_espera
 
 
+def test_firewall() -> None:
+    """host/firewall.sh e' o que faz o 19132 sobreviver a reboot na OCI.
+
+    Nao testamos iptables aqui (exige root e uma maquina de verdade). O que
+    trava e' o que quebra em silencio: CRLF no shebang, faixa UDP divergente
+    da documentada, e a recomendacao errada de SERVER_IP voltando na doc.
+    """
+    print("\n[firewall]")
+
+    raiz = Path(__file__).resolve().parent.parent
+    sh = raiz / "host" / "firewall.sh"
+    unit = raiz / "host" / "mine-bedrock-firewall.service"
+
+    check("host/firewall.sh existe", sh.is_file())
+    check("host/mine-bedrock-firewall.service existe", unit.is_file())
+    if not sh.is_file() or not unit.is_file():
+        return
+
+    bruto = sh.read_bytes()
+    texto = bruto.decode("utf-8")
+
+    # CRLF no shebang falha no boot com "bad interpreter: /bin/sh^M", e so
+    # apareceria no proximo reboot. E o que o .gitattributes existe pra evitar.
+    check("firewall.sh sem BOM", not bruto.startswith(b"\xef\xbb\xbf"))
+    check("firewall.sh em LF (CRLF quebra o shebang)", b"\r\n" not in bruto)
+    check("firewall.sh com shebang sh", texto.startswith("#!/bin/sh"))
+
+    # Sem o -C antes do -I, rodar duas vezes duplica regra a cada boot.
+    check("firewall.sh idempotente (iptables -C antes do -I)", "iptables -C INPUT" in texto)
+    check("firewall.sh insere no topo (-I INPUT 1)", "-I INPUT 1" in texto)
+
+    # A faixa UDP do firewall e a mesma que o server-udp-ports manda anunciar.
+    achado = re.search(r'UDP_PORTS="\$\{UDP_PORTS:-([^}]*)\}"', texto)
+    faixa_udp = achado.group(1).split() if achado else []
+    check(
+        "faixa UDP do firewall = 19133:19172 + 7551",
+        faixa_udp == ["19133:19172", "7551"],
+        f"veio {faixa_udp!r}",
+    )
+    check("firewall abre 19132/tcp (signalling)", "TCP_PORTS:-19132" in texto)
+
+    servico = unit.read_text(encoding="utf-8")
+    # /bin/sh explicito: ExecStart direto depende do bit de exec, que nao e
+    # garantido num checkout, e a falha aparece so no boot.
+    check("servico chama o script via /bin/sh", "ExecStart=/bin/sh /opt/mine-bedrock/firewall.sh" in servico)
+    check("servico espera a rede subir", "network-online.target" in servico)
+    check("servico habilita no boot", "WantedBy=multi-user.target" in servico)
+
+    # A faixa tem que bater com a doc, senao o usuario libera um e o outro fecha.
+    readme = (raiz / "README.md").read_text(encoding="utf-8")
+    check("README documenta a mesma faixa UDP", "19133:19172/udp" in readme)
+    check("README documenta o servico", "mine-bedrock-firewall" in readme)
+
+    # server-ip e' endereco de BIND. Se ele voltar a ser recomendado, o BDS nem
+    # sobe quando o IP publico nao e local, que e o caso de quase toda VPS NAT.
+    compose = (raiz / "compose.yml").read_text(encoding="utf-8")
+    exemplo = (raiz / ".env.example").read_text(encoding="utf-8")
+    check("compose.yml sem SERVER_IP", "SERVER_IP" not in compose)
+    check(".env.example nao define SERVER_IP", not re.search(r"^SERVER_IP=", exemplo, re.M))
+    check("README nao ensina /config server-ip=", "/config server-ip=" not in readme)
+
+
 if __name__ == "__main__":
     for teste in (
         test_detect_mcaddon,
@@ -1397,6 +1460,7 @@ if __name__ == "__main__":
         test_dropbox,
         test_backup,
         test_ops_backup,
+        test_firewall,
     ):
         teste()
     print()
