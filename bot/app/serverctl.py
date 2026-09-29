@@ -260,6 +260,12 @@ class ServerControl:
         self.props_path = data_dir / "server.properties"
         self.allowlist_path = data_dir / "allowlist.json"
         self.permissions_path = data_dir / "permissions.json"
+        # A doc do BDS avisa: "if a whitelist.json file is also present, it will
+        # be used instead of allowlist.json". O nome e' o antigo, de quando a
+        # lista se chamava whitelist, mas o arquivo continua valendo. Se ele
+        # existir, tudo que o bot grava no allowlist.json e' ignorado pelo
+        # servidor - em silencio, sem erro no log. Por isso a deteccao existe.
+        self.whitelist_path = data_dir / "whitelist.json"
 
     def _podar_backups(self, caminho: Path) -> None:
         """Mantem so os backup_keep mais novos de um arquivo.
@@ -350,6 +356,40 @@ class ServerControl:
 
     def allowlist(self) -> list[dict]:
         return self._lista(self.allowlist_path)
+
+    def tem_whitelist_json(self) -> bool:
+        """O arquivo antigo (whitelist.json) esta presente?
+
+        Se estiver, o BDS le ele em vez do allowlist.json - a doc oficial e
+        explicita: "if a whitelist.json file is also present, it will be used
+        instead of allowlist.json". E' um esconderijo: o bot grava a lista
+        certa, o /lista mostra a lista certa, e o servidor consulta a outra.
+        """
+        return self.whitelist_path.is_file()
+
+    def corrige_xuid(self, nome: str) -> bool:
+        """Tira o XUID de uma entrada para o servidor resolver de novo.
+
+        Um XUID gravado e' definitivo: o BDS valida a entrada por ele e nunca
+        re-resolve sozinho, entao um numero errado (ou de um gamertag que foi
+        redefinido) tranca o jogador para sempre - o sintoma e o "voce nao esta
+        na allow-list" de quem esta na lista. A saida e deixar o campo de fora:
+        a doc diz que o XUID "will be resolved the first time the player
+        connects", que e' exatamente o que a gente quer.
+
+        Devolve True se a entrada existia com XUID e ele foi removido.
+        """
+        dados = self.allowlist()
+        alvo = nome.lower()
+        mudou = False
+        for item in dados:
+            if str(item.get("name", "")).lower() != alvo:
+                continue
+            if item.pop("xuid", None):
+                mudou = True
+        if mudou:
+            self._salva_lista(self.allowlist_path, dados)
+        return mudou
 
     def permissoes(self) -> list[dict]:
         return self._lista(self.permissions_path)

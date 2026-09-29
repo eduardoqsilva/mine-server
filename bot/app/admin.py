@@ -39,8 +39,9 @@ AJUDA_ADMIN = "\n".join(
         txt.secao("👥", "jogadores"),
         txt.sub(
             [
-                "/lista  - quem pode entrar (e o que o servidor tem carregado)",
+                "/lista  - quem pode entrar (o que o servidor tem, o que so esta no arquivo)",
                 "/permitir <gamertag>  - adiciona na lista, sem precisar de xuid",
+                "  se o console nao responder, eu marco como pendente e reinicio sozinho",
                 "/removerjogador <gamertag>  - tira da lista",
                 "/negar <gamertag> [motivo]  - tira da lista e expulsa se estiver online",
                 "/permitido <gamertag>  - volta a liberar",
@@ -320,49 +321,81 @@ async def on_config_button(callback: CallbackQuery, ctx: AppContext) -> None:
 # ------------------------------------------------------------------ jogadores
 
 
+def _teclado_liberacao() -> InlineKeyboardMarkup:
+    """O botao que antecipa o reinicio. O prazo roda sozinho de qualquer jeito."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⏩ Reiniciar agora e liberar", callback_data="lib:agora"),
+                InlineKeyboardButton(text="Cancelar", callback_data="lib:cancelar"),
+            ]
+        ]
+    )
+
+
 @router.message(Command("lista"))
 async def cmd_lista(message: Message, ctx: AppContext) -> None:
-    props = await asyncio.to_thread(ctx.server.le_props)
-
-    try:
-        allow = await asyncio.to_thread(ctx.server.allowlist)
-    except serverctl.PropertyError as exc:
-        allow = []
-        arquivo_quebrado = str(exc)
-    else:
-        arquivo_quebrado = ""
+    # As tres fontes (console, arquivo e propriedade) sao lidas de uma vez e
+    # mostradas lado a lado. Enquanto cada tela montava a sua versao, elas
+    # discordavam - e o bot acabava descrevendo o arquivo como se fosse a lista.
+    estado = await asyncio.to_thread(ops.estado_real, ctx)
     negados = ctx.store.negados()
-    erro, do_servidor = await asyncio.to_thread(ops.allowlist_no_console, ctx, "list")
+    pendentes = [r["name"] for r in estado.pendentes]
 
     linhas = [txt.cabecalho(txt.JOGADORES, "lista de acesso"), ""]
-    # O que o servidor tem carregado agora e o unico que vale enquanto ele roda:
-    # e o que o BDS consulta quando o jogador tenta entrar.
+    # O console e' o que vale AGORA. O arquivo conta outra historia: o BDS le
+    # ele no boot e o reescreve no stop, entao ele descreve o passado.
     linhas.append(txt.secao(txt.CONSOLE, "o que o servidor tem agora"))
-    if erro:
-        linhas += ["", txt.aviso("nao consegui ler do console: " + erro)]
-    elif not do_servidor:
+    if estado.erro_console:
+        linhas += [
+            "",
+            txt.aviso("nao consegui ler do console: " + estado.erro_console),
+            txt.sub(["o resto desta tela e' so o arquivo; sem o console eu nao sei o que vale agora"]),
+        ]
+    elif not estado.linhas_servidor:
         linhas.append(txt.sub(["(o console nao devolveu nada)"]))
     else:
-        linhas += [txt.sub([l]) for l in do_servidor]
+        linhas += [txt.sub([l]) for l in estado.linhas_servidor]
+
+    # A divergencia e' o bug antigo, escrito: gente no arquivo que o servidor
+
+    # nao tem. Ela nao entra no jogo, e um "restart" resolveria apagando a prova.
+    so_arquivo = estado.so_no_arquivo()
+    if so_arquivo:
+        linhas += [
+            "",
+            txt.secao(txt.AVISO, "no arquivo, mas NAO no servidor", len(so_arquivo)),
+            txt.sub(["esta gente NAO entra: o BDS consulta a lista que tem em memoria"]),
+        ]
+        linhas += [txt.sub([f"• {nome}"]) for nome in so_arquivo]
+        linhas.append(txt.sub(["so reiniciar faz o arquivo virar lista: /permitir de novo, ou o botao"]))
+    if estado.whitelist_antigo:
+        linhas += [
+            "",
+            txt.aviso(
+                "existe um /data/whitelist.json: ele tem preferencia sobre o allowlist.json "
+                "enquanto existir. Apague-o, senao ele continua mandando na lista."
+            ),
+        ]
 
     # A propriedade decide o proximo boot, e e a unica coisa que o boot le.
-    ligado = props.get("allow-list") == "true"
+    ligado = estado.allow_list_arquivo == "true"
     linhas += [
         "",
         txt.secao("⚙️", "no arquivo (vale no proximo boot)"),
         txt.sub(
             [
-                f"allow-list = {props.get('allow-list', '(nao definido)')}",
+                f"allow-list = {estado.allow_list_arquivo or '(nao definido)'}",
                 "lista LIGADA" if ligado else "lista DESLIGADA: qualquer um pode entrar",
             ]
         ),
     ]
 
-    linhas.append(txt.secao("📄", "no allowlist.json", len(allow)))
-    if arquivo_quebrado:
-        linhas.append(txt.erro(arquivo_quebrado))
-    elif allow:
-        for item in allow:
+    linhas.append(txt.secao("📄", "no allowlist.json", len(estado.entradas_arquivo)))
+    if estado.erro_arquivo:
+        linhas.append(txt.erro(estado.erro_arquivo))
+    elif estado.entradas_arquivo:
+        for item in estado.entradas_arquivo:
             xuid = item.get("xuid")
             linhas.append(
                 txt.sub([f"{item.get('name', '?')}" + (f"  (xuid {xuid})" if xuid else "  (sem xuid ainda)")])
@@ -370,13 +403,21 @@ async def cmd_lista(message: Message, ctx: AppContext) -> None:
     else:
         linhas.append(txt.sub(["(ninguem ainda)"]))
 
+    if pendentes:
+        linhas.append(txt.secao("⏳", "liberacoes pendentes", len(pendentes)))
+        linhas.append(txt.sub(["ainda nao valem; eu reinicio sozinho para fazer valer"]))
+        for nome in pendentes:
+            linhas.append(txt.sub([f"• {nome}"]))
     if negados:
         linhas.append(txt.secao("🚫", "negados", len(negados)))
         linhas.append(txt.sub(["Nao voltam a lista sem /permitido <gamertag>"]))
         for d in negados:
             motivo = f" — {d['reason']}" if d.get("reason") else ""
             linhas.append(txt.sub([f"{d['name']}{motivo}"]))
-    await message.answer(_clip("\n".join(linhas)))
+    await message.answer(
+        _clip("\n".join(linhas)),
+        reply_markup=_teclado_liberacao() if pendentes else None,
+    )
 
 
 @router.message(Command("permitir"))
@@ -410,24 +451,77 @@ async def cmd_permitir(message: Message, command: CommandObject, ctx: AppContext
     # vez de liberar.
     ctx.store.audita(message.from_user.id, "permitir", nome)
 
-    _entrou, aviso = await ops.poe_na_lista(ctx, nome, xuid)
+    liberacao = await ops.poe_na_lista(ctx, nome, xuid)
     lista = await ops.liga_a_lista(ctx, message.from_user.id)
 
     corpo = [txt.cabecalho("👥", "liberar jogador"), "", txt.campo("Nome", nome), ""]
-    if aviso:
-        corpo.append(txt.aviso(aviso))
-    else:
+    teclado = None
+    if liberacao.estado == ops.LIBERADO:
+        corpo.append(txt.ok(f"{nome} esta na lista que o servidor tem carregada. Pode entrar."))
+        if liberacao.aviso:
+            corpo += ["", txt.info(liberacao.aviso)]
+        corpo += ["", txt.info("Foi sem reiniciar: vale para o servidor que esta rodando.")]
+    elif liberacao.estado == ops.LIBERADO_BOOT:
         corpo.append(
-            txt.ok(
-                f"{nome} entrou na lista e o servidor ja reconhece. "
-                "O xuid entra sozinho na primeira vez que ela entrar."
-            )
+            txt.ok(f"{nome} entrou no allowlist.json e o servidor esta parado, entao o proximo boot le isso.")
         )
+        if liberacao.aviso:
+            corpo += ["", txt.info(liberacao.aviso)]
+    elif liberacao.estado == ops.LIBERADO_FALHOU:
+        corpo += [
+            txt.erro(liberacao.aviso),
+            "",
+            txt.sub(["veja o arquivo: /data/allowlist.json, e /lista para o diagnostico"]),
+        ]
+    else:
+        # So no arquivo com o BDS rodando: ainda nao vale. Aqui o bot assume o
+        # reinicio - o botao e' o atalho, nao a permissao que falta.
+        corpo.append(txt.aviso(liberacao.aviso))
+        corpo += ["", await ops.agenda_liberacao(ctx, [nome], message.from_user.id, message.bot)]
+        teclado = _teclado_liberacao()
     if lista:
         corpo += ["", txt.info(lista)]
-    if not aviso and not lista:
-        corpo += ["", txt.info("Foi sem reiniciar: o comando vale para o servidor que esta rodando.")]
-    await message.answer(_clip("\n".join(corpo)))
+    await message.answer(_clip("\n".join(corpo)), reply_markup=teclado)
+
+
+@router.callback_query(F.data.startswith("lib:"))
+async def on_liberacao(callback: CallbackQuery, ctx: AppContext) -> None:
+    """Botao do /permitir: antecipa o reinicio, ou cancela o prazo.
+
+    O prazo nao e' uma permissao que o admin precise dar - ela ja foi dada no
+    /permitir. O botao existe porque 5 minutos de porta fechada sao 5 minutos de
+    reclamacao, e porque 'eu espero o timer' e' melhor do que o admin nao saber
+    se o bot vai cumprir o que prometeu.
+    """
+    pendentes = [r["name"] for r in ctx.store.liberacoes()]
+    if not pendentes:
+        await callback.answer("Nada pendente: essa liberacao ja foi concluida.", show_alert=True)
+        return
+
+    if callback.data == "lib:cancelar":
+        if ctx.liberacao_em_curso:
+            # O timer ja disparou e o servidor ja esta no chao. Dizer "cancelado"
+            # aqui seria o oposto de honesto: o mundo esta parado, o release vai
+            # terminar sozinho.
+            await callback.answer("O reinicio ja comecou, nao da para cancelar.", show_alert=True)
+            return
+        ctx.store.limpa_liberacoes()
+        ops.cancela_agenda(ctx)
+        await callback.answer("Cancelei.")
+        await callback.message.edit_text(
+            txt.aviso("Liberacao cancelada. As entradas ficaram no allowlist.json, sem efeito.")
+        )
+        return
+
+    ops.cancela_agenda(ctx)
+    await callback.answer("Reiniciando...")
+    quem = ", ".join(pendentes)
+    await callback.message.edit_text(txt.info(f"Reiniciando para liberar {quem}..."))
+    relatorio = await ops.dispara_pendente(ctx)
+    try:
+        await callback.message.edit_text(_clip(relatorio))
+    except Exception:  # noqa: BLE001 - a mensagem pode ser velha demais para editar
+        await callback.message.answer(_clip(relatorio))
 
 
 @router.message(Command("removerjogador"))

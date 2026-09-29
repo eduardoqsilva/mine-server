@@ -24,24 +24,13 @@ from aiogram.types import BotCommandScopeDefault
 from . import admin, handlers, ops, txt
 from .auth import AuthMiddleware
 from .config import Config, ConfigError
-from .ops import AppContext
+from .ops import AppContext, notificar
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
 )
 log = logging.getLogger("bds.main")
-
-
-async def notificar(bot: Bot, ctx: AppContext, texto: str) -> None:
-    """Manda para os admins registrados."""
-    alvos = [u.user_id for u in ctx.store.usuarios() if u.eh_admin]
-    for user_id in alvos:
-        try:
-            await bot.send_message(user_id, texto)
-            log.info("avisei %s (%d chars)", user_id, len(texto))
-        except Exception as exc:
-            log.warning("nao consegui avisar %s: %s", user_id, exc)
 
 
 async def reconciliador(ctx: AppContext, bot: Bot) -> None:
@@ -252,6 +241,10 @@ async def main() -> None:
         asyncio.create_task(vigia(ctx, bot)),
         asyncio.create_task(faxina(ctx)),
     ]
+    # Depois das tasks e antes do polling: um /permitir pendente de antes do
+    # downtime volta a contar. A pendencia esta no bot.db justamente para isso -
+    # a task em si morreu com o container anterior.
+    ops.rearma_pendencia(ctx, bot)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         if admins:
@@ -281,6 +274,11 @@ async def main() -> None:
     finally:
         for task in tasks:
             task.cancel()
+        if ctx.tarefa_liberacao is not None:
+            # O cancelamento e' o de sempre: a pendencia continua no bot.db e o
+            # boot seguinte rearma. Encerrar o bot nao e' um "cancelou" - e a
+            # diferenca entre o prazo sobreviver a um restart e sumir.
+            ctx.tarefa_liberacao.cancel()
         await bot.session.close()
         ctx.store.fecha()
 

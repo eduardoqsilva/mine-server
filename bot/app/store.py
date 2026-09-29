@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS denied (
     by     INTEGER,
     at     REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS liberacao (
+    name TEXT PRIMARY KEY COLLATE NOCASE,
+    by   INTEGER,
+    at   REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     at      REAL NOT NULL,
@@ -338,6 +343,35 @@ class Store:
         with self._lock:
             row = self._db.execute("SELECT 1 FROM denied WHERE name = ?", (nome,)).fetchone()
         return row is not None
+
+    # -------------------------------------------------------- liberacao pendente
+
+    # A liberacao que depende de um reinicio fica anotada aqui, e nao em memoria
+    # do processo, por causa do auto-restart das 05:00: um `docker compose up -d
+    # bot` no meio da espera apagaria o timer e a liberacao ficaria pendente sem
+    # ninguem para lembrar. Anotada, ela volta sozinha no boot seguinte.
+    def marca_liberacao(self, nome: str, by: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO liberacao (name, by, at) VALUES (?,?,?)",
+                (nome, by, time.time()),
+            )
+            self._db.commit()
+
+    def liberacoes(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM liberacao ORDER BY at").fetchall()
+        return [dict(r) for r in rows]
+
+    def apaga_liberacao(self, nome: str) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM liberacao WHERE name = ?", (nome,))
+            self._db.commit()
+
+    def limpa_liberacoes(self) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM liberacao")
+            self._db.commit()
 
     # ---------------------------------------------------------------- auditoria
 

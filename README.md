@@ -47,6 +47,7 @@ No `.env`:
 | `LEVEL_NAME` | nome da pasta do mundo em `data/worlds/` (so o 1o boot usa) |
 | `UPDATE_HOUR` / `UPDATE_MINUTE` | horario do restart diario (padrao 05:00) |
 | `BOOT_TIMEOUT` | segundos que o bot espera o jogo subir (padrao 240) |
+| `ALLOWLIST_GRACE_SECONDS` | quanto tempo o `/permitir` espera antes de reiniciar sozinho para a liberação valer (padrao 300, `0` desliga) |
 | `BACKUP_KEEP` | versoes antigas guardadas de cada pack (padrao 3) |
 
 Gere o codigo de resgate com `openssl rand -hex 6` e **guarde**: ele e a senha do
@@ -231,8 +232,8 @@ tela de packs do cliente.
 | `/config <chave> <valor>` | muda na mao (ex.: `/config difficulty hard`) |
 | `/config <chave> <valor> sim` | confirma as propriedades que pedem cuidado |
 | `/config aplicar` | reescreve em `server.properties` o que o bot guardou |
-| `/lista` | o que o servidor tem carregado, a propriedade e quem esta negado |
-| `/permitir <gamertag>` | adiciona na allow-list, sem precisar de xuid (liga a lista se preciso) |
+| `/lista` | o que o servidor tem carregado, o que esta so no arquivo, a propriedade e quem esta negado |
+| `/permitir <gamertag>` | adiciona na allow-list, sem precisar de xuid (liga a lista e, se preciso, agenda o reinicio) |
 | `/removerjogador <gamertag>` | tira da allow-list |
 | `/negar <gamertag> [motivo]` | tira da lista, manda kick e marca como negado |
 | `/permitido <gamertag>` | tira da lista de negados |
@@ -396,19 +397,41 @@ depois de um restart", e é por isso que o bot não aceita mais um
 liberou se o nome aparecer na resposta.
 
 Quando o console não responde (é o caso do Docker Desktop no Windows, onde o
-`send-command` não acha o processo do BDS), o bot cai para o arquivo + `allowlist
-reload`, e o aviso depende do estado do servidor:
+`send-command` não acha o processo do BDS), o bot grava no `allowlist.json` — e
+aí a resposta honesta depende do estado do servidor:
 
 - **BDS parado** — funciona. O próximo boot lê o arquivo, a entrada entra na
   memória dele, e a partir daí quem mantém a lista é o próprio BDS.
-- **BDS rodando** — a edição é frágil, e o bot avisa que é. Um `stop` faz o
-  servidor reescrever o arquivo com a lista antiga e a entrada se perde;
-  reiniciar nesse momento seria exatamente o jeito de perder a edição. O
-  caminho que segura é o console: `/permitir` de novo, quando ele responder.
+- **BDS rodando** — a entrada **ainda não vale**. O BDS consulta a lista que tem
+  em memória, e o próximo `stop` reescreve o arquivo a partir dela, levando a
+  edição junto.
 
-É por isso que o `/permitir` não aceita um "pronto" sem prova: ele roda
-`allowlist list` depois do `add` e só diz que liberou se o nome aparecer na
-resposta.
+No segundo caso o bot não para aí. O `/permitir` marca a liberação como
+**pendente** e avisa que vai reiniciar sozinho em `ALLOWLIST_GRACE_SECONDS`
+(5 minutos por padrão) para fazer a entrada valer de verdade. A mensagem no
+Telegram mostra o horário exato, e a pendência fica no `bot.db`: um
+`docker compose restart` do bot no meio da espera não cancela a promessa, o bot
+rearma o prazo no boot seguinte. O botão **"⏩ Reiniciar agora e liberar"** só
+antecipa o que ia acontecer sozinho; **"Cancelar"** desfaz. Com
+`ALLOWLIST_GRACE_SECONDS=0` o automático é desligado e a decisão volta para a
+sua mão.
+
+O reinício acontece na única ordem que faz a entrada sobreviver: o bot **para**
+o servidor (é o `stop` que para de reescrever o `allowlist.json`), grava
+`allow-list=true` e as entradas pendentes, e **sobe** de novo — o boot passa a
+lista para a memória do BDS. Antes de derrubar qualquer coisa ele pergunta
+`allowlist list` de novo: se o console voltou e o servidor já tem todo mundo, o
+reinício é cancelado e o downtime é zero.
+
+Se o `allowlist add` é aceito mas o nome não aparece no `allowlist list`, quase
+sempre é uma entrada antiga presa num XUID: o BDS valida a entrada por ele e não
+re-resolve o nome. O bot tira o campo, manda `allowlist reload` e tenta de novo
+antes de dizer que falhou.
+
+Detalhe que derruba tudo se for ignorado: se existir um `/data/whitelist.json`,
+ele tem **preferência** sobre o `allowlist.json` e continua mandando na lista,
+por mais que o `allowlist.json` esteja certo. O `/lista` avisa quando encontra
+um.
 
 O `xuid` virou opcional de propósito. A doc do BDS é explícita: *"you don't
 need to specify a XUID here, it will be resolved the first time the player
@@ -419,10 +442,14 @@ número mesmo, `/permitir <gamertag> <xuid>` ainda aceita.
 
 A `allow-list` do `server.properties` é lida **só no boot**, então o `/permitir`
 manda `allowlist on` (que liga em runtime) e grava `allow-list=true` no arquivo
-para o próximo boot. O `/config allow-list` faz o mesmo e não derruba o servidor.
+para o próximo boot. O `allowlist on` vai sempre, mesmo com o arquivo já em
+`true`: o `stop` reescreve essa propriedade a partir do estado de runtime, e ele
+pode ter virado `false` num boot em que o arquivo ainda era `true`. O `/config
+allow-list` faz o mesmo e não derruba o servidor.
 O `/lista` mostra as três coisas: o que o servidor tem carregado agora (é isso
 que ele consulta quando alguém tenta entrar), a propriedade do arquivo e as
-entradas com o XUID que o próprio BDS preencheu.
+entradas com o XUID que o próprio BDS preencheu — e, em destaque, quem está
+**no arquivo mas não no servidor**, que é a lista de gente que não vai entrar.
 
 **Sobre "negar"**: o Bedrock nao tem lista de bloqueio. O que o bot faz e tirar o
 jogador da allow-list, mandar `kick` e guardar o nome como negado (o `/permitir`
@@ -542,7 +569,10 @@ Sintoma por etapa:
 | so da rede local funciona, de fora nao | NAT/ingress do provedor: ajuste o `SERVER_UDP_PORTS` do `.env` para o IP publico e rode `docker compose up -d bds`. **Nao** mexa no `server-ip` (e' bind, e nao valor anunciado) |
 | so funciona local e quebra de novo apos reboot | regra de `iptables` digitada a mao: o cloud-init da OCI reescreve o `INPUT`. Instale o `mine-bedrock-firewall.service` |
 | tudo acima ok e o jogo nao entra | DNS/Cloudflare: o registro tem que ser **cinza** (Cloudflare nao proxya UDP) |
-| `/permitir` diz que liberou e o jogador nao entra | a `allow-list` esta desligada, ou o console do BDS nao respondeu e o bot avisou que a edicao do arquivo e fragil. `/lista` mostra o que o servidor tem carregado |
+| `/permitir` diz que liberou e o jogador nao entra | a `allow-list` esta desligada, ou o console do BDS nao respondeu (aí ele diz "pendente" e marca o reinicio). `/lista` mostra o que o servidor tem carregado e quem esta so no arquivo |
+| `/permitir` ficou "pendente" e o jogador espera | o reinicio automatico esta em `ALLOWLIST_GRACE_SECONDS` (300s). O botao "Reiniciar agora" antecipa; `/lista` mostra a secao "liberacoes pendentes" |
+| a liberacao prometida sumiu depois de reiniciar o bot | nao deveria: a pendencia esta no `bot.db` e e rearmada no boot. Se `ALLOWLIST_GRACE_SECONDS=0`, ninguem reinicia e a pendencia fica parada |
+| o `/lista` avisa sobre `whitelist.json` | apague o `/data/whitelist.json`: ele tem preferencia sobre o `allowlist.json` e continua mandando na lista |
 
 Duas regras do `server-udp-ports` que valem no BDS 1.26.51+, e que nao dao erro
 quando estao erradas - o servidor sobe e loga `Server started.` normalmente:

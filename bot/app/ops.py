@@ -6,15 +6,20 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 from . import addons, backup, dropbox, raknet, serverctl, txt
 from .auth import Auth
 from .config import Config
 from .docker_ctl import DockerController
 from .store import Store
+
+if TYPE_CHECKING:  # so a anotacao; o bot so existe dentro do container do bot
+    from aiogram import Bot
 
 log = logging.getLogger("bds.ops")
 
@@ -32,6 +37,15 @@ class AppContext:
     # ligado durante um restart pedido pelo proprio bot, para a vigia nao
     # duplicar o aviso que o /reiniciar ja mandou no chat.
     em_restart: bool = False
+    # Task do "reinicio em 5 min" do /permitir. Vive aqui, e nao em variavel
+    # solta, para o botao poder cancelar e para o shutdown do bot saber o que
+    # deixar de lado. A lista dos nomes que dependem dela esta no bot.db
+    # (store.liberacoes), entao um recreate do container nao perde o prazo.
+    tarefa_liberacao: asyncio.Task | None = None
+    # ligado entre o para() e o espera_pronto() da liberacao. Sem ele, um
+    # botao apertado no meio do reinicio cancelaria a task e o container ficaria
+    # parado: o stop do docker ja saiu da thread quando o cancelamento chega.
+    liberacao_em_curso: bool = False
 
     @classmethod
     def build(cls, config: Config) -> "AppContext":
@@ -49,6 +63,23 @@ class AppContext:
     def mundo(self) -> str:
         """Nome da pasta do mundo: server.properties manda, .env e so reserva."""
         return self.server.nivel_do_mundo(self.config.level_name)
+
+
+async def notificar(bot: Bot, ctx: AppContext, texto: str) -> None:
+    """Manda para os admins registrados.
+
+    Mora aqui, e nao no main, porque a liberacao pendente do /permitir tambem
+    precisa falar com o chat - e quando ela fala sozinha (o reinicio de 5 min
+    disparando sozinho) nao existe mais nenhum handler esperando para responder.
+    """
+    for user in ctx.store.usuarios():
+        if not user.eh_admin:
+            continue
+        try:
+            await bot.send_message(user.user_id, texto)
+            log.info("avisei %s (%d chars)", user.user_id, len(texto))
+        except Exception as exc:
+            log.warning("nao consegui avisar %s: %s", user.user_id, exc)
 
 
 def overrides_sujo(ctx: AppContext) -> list[tuple[str, str, str]]:
@@ -149,12 +180,23 @@ def resposta_console(comando: str, linhas: list[str], erro: str = "", limite: in
 
 # --------------------------------------------------------------- allow-list
 
-# O console e a fonte da verdade da allow-list, e o arquivo e o reserva. Isso
+# O console e a fonte da verdade da allow-list, e o arquivo e a reserva. Isso
 # nao e preciosismo: o BDS reescreve allowlist.json quando desliga, a partir da
 # lista que tem em memoria. Quem escreve no arquivo sem o servidor saber
 # (allowlist reload recusado, comando nunca entregue) tem a entrada apagada no
 # proximo stop - que e o "adicionei a pessoa e ela sumiu da lista depois de um
 # restart".
+
+# O que um /permitir pode ter conseguido. O bot nao diz "liberado" sem saber em
+# qual destes ele caiu: a diferenca entre eles e se o jogador entra ou nao.
+LIBERADO = "servidor"  # o console adicionou e o 'allowlist list' confirmou
+LIBERADO_BOOT = "boot"  # so no arquivo, mas o BDS esta parado: o boot le
+LIBERADO_PENDENTE = "pendente"  # no arquivo com o BDS rodando: precisa reiniciar
+LIBERADO_FALHOU = "falhou"  # nem no console nem no arquivo: nao foi pra lugar nenhum
+
+RE_SO_NUMEROS = re.compile(r"^[\d\s()\-]+$")
+
+
 def allowlist_no_console(ctx: AppContext, *args: str) -> tuple[str, list[str]]:
     """Manda 'allowlist ...' no console do BDS.
 
@@ -169,74 +211,199 @@ def allowlist_no_console(ctx: AppContext, *args: str) -> tuple[str, list[str]]:
     return "", limpa_resposta(comando, linhas)
 
 
-def tem_nome(linhas: list[str], nome: str) -> bool:
-    """O nome aparece na resposta do console?"""
-    alvo = nome.lower()
-    return any(alvo in linha.lower() for linha in linhas)
+def _casa(linha: str, nome: str) -> bool:
+    """Esta linha do 'allowlist list' e' a entrada do jogador?"""
+    limpa = linha.strip().lstrip("*-").strip().strip('"').strip()
+    alvo = nome.strip().strip('"').lower()
+    if limpa.lower() == alvo:
+        return True
+    # o BDS pode repetir o xuid na mesma linha ("Ze (2535463291192118)"). So
+    # aceita quando o nome ocupa a linha INTEIRA ate o separador e o que sobra
+    # e' so numero: e o que separa "Ze: 2535..." (a lista) de "Ze: ola" (chat).
+    for sep in (" - ", ":", " ("):
+        if sep not in limpa:
+            continue
+        nome_linha, _, resto = limpa.partition(sep)
+        if nome_linha.strip().lower() == alvo and RE_SO_NUMEROS.match(resto.strip()):
+            return True
+    return False
 
 
-def _aviso_arquivo(ctx: AppContext, erro: str, gravou: bool, o_que: str) -> str:
-    """O que dizer quando so deu para mexer no arquivo, e nao no console.
+def confirmado(linhas: list[str], nome: str) -> bool:
+    """O servidor diz que tem este jogador na lista?
 
-    O detalhe que muda tudo: se o BDS esta PARADO, o proximo boot le o arquivo
-    e a entrada entra na memoria dele - ai funciona, e o /reiniciar resolve. Se
-    o BDS esta RODANDO e o console nao responde, o proximo stop faz o servidor
-    reescrever o arquivo a partir da lista velha e a edicao se perde; mandar
-    reiniciar seria exatamente o jeito de perder a entrada. Nesse caso o
-    caminho e' o console.
+    Errar para "nao" e de graca: o /permitir avisa e o admin confere no /lista.
+    Errar para "sim" e' o bug que este projeto estava tendo - a versao anterior
+    procurava o nome com `in` em qualquer linha, e a janela de log que o
+    console() devolve traz chat, entrada de jogador e o proprio eco do comando.
+    Um "ola" no chat do Ze confirmava a liberacao de quem o Ze nao esta.
     """
-    if not gravou:
-        return f"Nao consegui falar com o console do BDS: {erro}. Ele nem estava no arquivo."
+    return any(_casa(linha, nome) for linha in linhas)
+
+
+@dataclass
+class EstadoLista:
+    """O retrato da allow-list de tres fontes, que precisam concordar entre si.
+
+    Antes o /lista, o /status e o /permitir montavam cada um a sua versao, e
+    eles discordavam - que e como o bot acabava dizendo "liberado" olhando o
+    arquivo enquanto o servidor consultava outra coisa.
+    """
+
+    erro_console: str = ""
+    linhas_servidor: list[str] = field(default_factory=list)
+    entradas_arquivo: list[dict] = field(default_factory=list)
+    erro_arquivo: str = ""
+    allow_list_arquivo: str = ""
+    whitelist_antigo: bool = False
+    pendentes: list[str] = field(default_factory=list)
+
+    @property
+    def servidor_consultavel(self) -> bool:
+        """Da para perguntar ao servidor o que ele tem?"""
+        return not self.erro_console
+
+    def tem_no_servidor(self, nome: str) -> bool:
+        return confirmado(self.linhas_servidor, nome)
+
+    def so_no_arquivo(self) -> list[str]:
+        """Quem esta gravado mas o servidor nao tem: nao entra no jogo.
+
+        So quando o console respondeu. Sem ele nao da para saber o que o
+        servidor tem, e afirmar "voce nao esta na lista" seria inventar.
+        """
+        if not self.servidor_consultavel:
+            return []
+        return [
+            nome
+            for nome in (str(item.get("name", "")).strip() for item in self.entradas_arquivo)
+            if nome and not self.tem_no_servidor(nome)
+        ]
+
+
+def estado_real(ctx: AppContext) -> EstadoLista:
+    """Le a allow-list de onde cada uma das tres fontes diz que esta.
+
+    Faz tres leituras bloqueantes (console, arquivo, propriedades): sempre por
+    asyncio.to_thread na chamada. O console e' o mais caro - leva ate 3s quando
+    o comando nao responde nada.
+    """
+    erro_console, linhas = allowlist_no_console(ctx, "list")
+    try:
+        entradas = ctx.server.allowlist()
+    except serverctl.PropertyError as exc:
+        entradas, erro_arquivo = [], str(exc)
+    else:
+        erro_arquivo = ""
+    return EstadoLista(
+        erro_console=erro_console,
+        linhas_servidor=linhas,
+        entradas_arquivo=entradas,
+        erro_arquivo=erro_arquivo,
+        allow_list_arquivo=ctx.server.le_props().get("allow-list", ""),
+        whitelist_antigo=ctx.server.tem_whitelist_json(),
+        pendentes=[r["name"] for r in ctx.store.liberacoes()],
+    )
+
+
+@dataclass
+class Liberacao:
+    estado: str
+    aviso: str = ""
+
+
+async def poe_na_lista(ctx: AppContext, nome: str, xuid: str | None = None) -> Liberacao:
+    """Coloca o jogador na allow-list. Devolve em que estado ela ficou.
+
+    O console vem primeiro porque o 'allowlist add' e' o caminho que sobrevive:
+    o BDS resolve o XUID, grava o arquivo no formato dele e ja passa a valer
+    para o servidor que esta rodando. O arquivo so e' tocado quando o console
+    nao entrega o nome, e nesse caso a entrada so vale no proximo boot - ou,
+    com o BDS rodando, depois do reinicio que o /permitir agenda.
+
+    Devolve sempre um estado, nunca um "ok" vago: a diferenca entre LIBERADO e
+    LIBERADO_PENDENTE e exatamente a diferenca entre o jogador entrar agora e o
+    jogador ficar na porta.
+    """
+    erro, _linhas = await asyncio.to_thread(allowlist_no_console, ctx, "add", serverctl.cita(nome))
+    if not erro:
+        _e, listadas = await asyncio.to_thread(allowlist_no_console, ctx, "list")
+        if confirmado(listadas, nome):
+            return Liberacao(LIBERADO)
+        # O console aceitou e a lista nao mostra o nome. A causa mais comum nao
+        # e' console mudo: e' entrada antiga no arquivo com XUID, porque o BDS
+        # valida por ele e nunca re-resolve o nome. Tirar o campo resolve.
+        if await asyncio.to_thread(ctx.server.corrige_xuid, nome):
+            await asyncio.to_thread(allowlist_no_console, ctx, "reload")
+            _e, listadas = await asyncio.to_thread(allowlist_no_console, ctx, "list")
+            if confirmado(listadas, nome):
+                return Liberacao(
+                    LIBERADO,
+                    "A entrada estava presa num XUID velho e o servidor nao ia liberar ninguem com "
+                    "ele. Tirei o campo e ele resolveu o nome de novo.",
+                )
+        return await _so_no_arquivo(
+            ctx, nome, xuid, erro, "o console aceitou o comando, mas 'allowlist list' nao devolveu o nome"
+        )
+
+    return await _so_no_arquivo(ctx, nome, xuid, erro, "o console nao respondeu")
+
+
+async def _so_no_arquivo(
+    ctx: AppContext, nome: str, xuid: str | None, erro: str, explicacao: str
+) -> Liberacao:
+    """    O console nao serviu: grava no arquivo e diz se isso chega a valer.
+
+    O detalhe que muda tudo: se o BDS esta PARADO, o proximo boot le o arquivo e
+    a entrada entra na memoria dele - ai funciona. Se o BDS esta RODANDO, so
+    reiniciar faz a entrada valer, porque o stop reescreve o arquivo a partir
+    da lista velha e leva a edicao junto - e e por isso que o /permitir agenda o
+    reinicio em vez de so avisar.
+    """
+    try:
+        await asyncio.to_thread(ctx.server.add_allowlist, nome, xuid)
+    except serverctl.PropertyError as exc:
+        # allowlist.json ilegivel. Nao adianta agendar reinicio: sem arquivo
+        # nao ha o que o boot ler, e o bot nao pode marcar pendencia que ele
+        # mesmo nao vai conseguir cumprir.
+        return Liberacao(LIBERADO_FALHOU, f"Nao consegui gravar no allowlist.json: {exc}")
+    if erro:
+        await asyncio.to_thread(allowlist_no_console, ctx, "reload")
+
     try:
         rodando = ctx.docker.state().running
     except Exception:  # noqa: BLE001 - o aviso nao pode falhar por causa do docker
         rodando = True
     if not rodando:
-        return (
-            f"Nao consegui falar com o console do BDS: {erro}. Como o servidor esta parado, "
-            f"{o_que} no allowlist.json e o proximo boot ja le isso."
+        return Liberacao(
+            LIBERADO_BOOT,
+            f"Como o servidor esta parado, gravei no allowlist.json e o proximo boot ja le isso ({explicacao}: {erro}).",
         )
-    return (
-        f"Nao consegui falar com o console do BDS: {erro}. {o_que.capitalize()} no allowlist.json, "
-        "mas o servidor esta rodando e ele reescreve esse arquivo quando desliga: um restart agora "
-        "apagaria a entrada. O jeito que segura e pelo console - o /permitir de novo, quando ele "
-        "responder."
+    return Liberacao(
+        LIBERADO_PENDENTE,
+        f"Gravei no allowlist.json, mas {explicacao} ({erro}) e o servidor esta rodando: enquanto "
+        "isso a entrada nao vale, porque ele consulta a lista que tem em memoria.",
     )
-
-
-async def poe_na_lista(ctx: AppContext, nome: str, xuid: str | None = None) -> tuple[bool, str]:
-    """Coloca o jogador na allow-list. Devolve (entrou, o que o admin precisa saber).
-
-    O console vem primeiro porque o 'allowlist add' e' o caminho que sobrevive:
-    o BDS resolve o XUID, grava o arquivo no formato dele e ja passa a valer
-    para o servidor que esta rodando. O arquivo so e' tocado quando o console
-    nao responde, e nesse caso a entrada so vale no proximo boot.
-    """
-    erro, _linhas = await asyncio.to_thread(allowlist_no_console, ctx, "add", serverctl.cita(nome))
-    if not erro:
-        _erro, listadas = await asyncio.to_thread(allowlist_no_console, ctx, "list")
-        if tem_nome(listadas, nome):
-            return True, ""
-        # o comando foi entregue e o servidor nao devolveu o nome: nao da para
-        # dizer que liberou. Fala isso em vez de mentir com um "pronto".
-        return True, (
-            "Mandei 'allowlist add' mas o console nao devolveu o nome em "
-            "'allowlist list'. Se ela nao entrar, mande /lista: ele mostra o "
-            "que o servidor tem carregado."
-        )
-
-    novo = await asyncio.to_thread(ctx.server.add_allowlist, nome, xuid)
-    await asyncio.to_thread(allowlist_no_console, ctx, "reload")
-    return novo, _aviso_arquivo(ctx, erro, novo, "gravei")
 
 
 async def tira_da_lista(ctx: AppContext, nome: str) -> tuple[bool, str]:
     """Tira o jogador da allow-list. Devolve (saiu, o que o admin precisa saber)."""
     erro, _linhas = await asyncio.to_thread(allowlist_no_console, ctx, "remove", serverctl.cita(nome))
+    # Sai da fila de pendencia: nao faz sentido o bot reiniciar o servidor
+    # daqui a 5 min para liberar quem o admin acabou de tirar.
+    ctx.store.apaga_liberacao(nome)
     if not erro:
         return True, ""
     removido = await asyncio.to_thread(ctx.server.remove_allowlist, nome)
-    return removido, _aviso_arquivo(ctx, erro, removido, "tirei")
+    return removido, (
+        f"Nao consegui falar com o console do BDS: {erro}. "
+        + (
+            "Tirei do allowlist.json, e o proximo boot ja le isso."
+            if not ctx.docker.state().running
+            else "Tirei do allowlist.json, mas o servidor esta rodando: o proximo stop reescreve "
+            "o arquivo e o jogador volta a estar na lista. O jeito que segura e o console."
+        )
+    )
 
 
 async def liga_a_lista(ctx: AppContext, by: int) -> str:
@@ -244,16 +411,299 @@ async def liga_a_lista(ctx: AppContext, by: int) -> str:
 
     Sem isso o /permitir nao libera ninguem: a propriedade e lida so no boot, e
     enquanto ela estiver desligada a lista nao bloqueia nem libera ninguem.
+
+    O 'allowlist on' vai sempre, mesmo com o arquivo ja em true, e nao so quando
+    o valor muda: a propriedade e' lida no boot, mas o BDS reescreve
+    allow-list no shutdown a partir do estado de runtime. Depois de um stop
+    dessas o arquivo pode estar true e o servidor ter ficado ligado desde um
+    boot em que estava false - e ai o bot acha que a lista esta no ar sem
+    estar.
     """
     props = await asyncio.to_thread(ctx.server.le_props)
-    if props.get("allow-list") == "true":
-        return ""
-    await asyncio.to_thread(ctx.server.set_prop, "allow-list", "true")
-    ctx.store.set_override("allow-list", "true", by)
+    ja_no_arquivo = props.get("allow-list") == "true"
+    if not ja_no_arquivo:
+        await asyncio.to_thread(ctx.server.set_prop, "allow-list", "true")
+        ctx.store.set_override("allow-list", "true", by)
     erro, _linhas = await asyncio.to_thread(allowlist_no_console, ctx, "on")
     if erro:
+        if ja_no_arquivo:
+            return (
+                f"allow-list=true no arquivo, mas o console nao aceitou o 'allowlist on' ({erro}). "
+                "Enquanto o console mudo so o boot liga a lista."
+            )
         return f"Gravei allow-list=true, mas o console nao aceitou o 'allowlist on' ({erro})."
-    return "A lista estava desligada; liguei agora e tambem gravei allow-list=true, entao o proximo boot ja vem ligada."
+    if not ja_no_arquivo:
+        return "A lista estava desligada; liguei agora e tambem gravei allow-list=true, entao o proximo boot ja vem ligada."
+    return ""
+
+
+# -------------------------------------------------- liberacao com reinicio
+
+def _prazo_texto(segundos: int, tz: ZoneInfo) -> str:
+    """'em 5 min (14:37)': o relativo e o horario, porque a mensagem fica na tela.
+
+    O horario e' do fuso do servidor, e nao UTC: as duas informacoes batem com
+    o relogio do admin, e o prazo e' sempre o do primeiro pedido - que e o que
+    `restante()` calcula, e nao `segundos` de novo.
+    """
+    relativo = f"em {max(1, round(segundos / 60))} min" if segundos >= 60 else "daqui a pouco"
+    return f"{relativo} ({datetime.now(tz).strftime('%H:%M')})"
+
+
+def restante(ctx: AppContext) -> int:
+    """Quantos segundos faltam para o prazo, medido da primeira marcacao.
+
+    E' da mais antiga, e nao da ultima: um segundo /permitir nao estica o prazo
+    do primeiro, senao o admin perderia o horario que ele leu na tela.
+    """
+    pendentes = ctx.store.liberacoes()
+    if not pendentes:
+        return 0
+    mais_velho = min(r["at"] for r in pendentes)
+    return max(0, int(mais_velho + ctx.config.allowlist_grace_seconds - time.time()))
+
+
+async def libera_reiniciando(ctx: AppContext, nomes: list[str], by: int | None = None) -> str:
+    """Faz a liberacao valer de verdade: para, regrava o arquivo, sobe.
+
+    A ordem nao e' detalhe, e' o mecanismo inteiro:
+
+    1. `para()` so volta quando o container morreu, e o BDS reescreve o
+       allowlist.json no shutdown a partir da lista que tem em memoria. Entao o
+       arquivo ja foi reescrito quando a escrita nova acontece, e a entrada
+       sobrevive em vez de ser apagada. Escrever antes do stop seria o jeito
+       certo de perder a liberacao - era o que o aviso antigo ensinava.
+    2. allow-list=true e reafirmado pelo mesmo motivo: o mesmo stop grava o
+       valor de runtime, e ele pode ter virado false.
+    3. `liga()` e espera_pronto: o boot le o arquivo, a lista entra na memoria
+       do servidor, e de la em diante quem mantem a lista e' o proprio BDS.
+
+    A trava de reinicio e a mesma do /reiniciar e do backup: dois stops no
+    mesmo minuto se atropelam, e o primeiro reporta "o servidor nao subiu" sem
+    ele ter subido ainda. O em_restart liga para a vigia nao mandar "o servidor
+    caiu" durante uma parada que o proprio bot pediu.
+    """
+    nomes = [n for n in dict.fromkeys(nomes) if n.strip()]
+    if not nomes:
+        return txt.info("Nao ha liberacao pendente.")
+    async with _restart_lock(ctx):
+        try:
+            ctx.em_restart = True
+            return await _libera_pendente(ctx, nomes, by)
+        except Exception as exc:
+            # NUNCA levanta: quem chamou ja mandou "reiniciando..." e uma
+            # excecao subindo deixaria o admin olhando para o silencio. E o
+            # log.exception (e nao o raise) que faz o Codigo terminar com um
+            # relatorio em vez de um traceback no Telegram.
+            log.exception("libera_reiniciando levantou")
+            return _falhou(
+                f"liberar {', '.join(nomes)}",
+                f"Falha inesperada durante a liberacao: {exc}",
+                "Veja: docker compose logs bds",
+            )
+        finally:
+            ctx.em_restart = False
+
+
+async def _libera_pendente(ctx: AppContext, nomes: list[str], by: int | None) -> str:
+    cfg = ctx.config
+    quem = ", ".join(nomes)
+
+    if cfg.announce_seconds > 0:
+        await asyncio.to_thread(
+            ctx.docker.say, f"[bot] liberando {quem} - reiniciando em {cfg.announce_seconds}s"
+        )
+        await asyncio.sleep(cfg.announce_seconds)
+
+    ctx.liberacao_em_curso = True
+    try:
+        # O para() fica dentro do try de proposito. Se o bot levar um SIGTERM ou
+        # for cancelado bem no meio (o shutdown cancela as tasks), o `liga` do
+        # finally roda do mesmo jeito: perder a liberacao e' aceitavel, deixar o
+        # BDS parado nao e - o boot e' o que faz o jogo voltar, e ele nao
+        # depende do processo do bot.
+        await asyncio.to_thread(ctx.docker.para)
+
+        problema = ""
+        try:
+            await asyncio.to_thread(ctx.server.set_prop, "allow-list", "true")
+        except serverctl.PropertyError as exc:
+            problema = f"O server.properties nao pode ser lido com o servidor parado: {exc}"
+        else:
+            ctx.store.set_override("allow-list", "true", by or 0)
+        if not problema:
+            for nome in nomes:
+                await asyncio.to_thread(ctx.server.add_allowlist, nome)
+                ctx.store.audita(by, "permitir", f"{nome} (liberado no reinicio)")
+            # So agora a pendencia sai: enquanto a escrita nao aconteceu, ela
+            # continua marcada e o proximo /permitir tenta de novo.
+            ctx.store.limpa_liberacoes()
+    finally:
+        # Em qualquer caminho, inclusive numa escrita que explodiu no meio: o
+        # servidor parado por causa do bot e' pior do que a liberacao perdida.
+        try:
+            await asyncio.to_thread(ctx.docker.liga)
+        finally:
+            ctx.liberacao_em_curso = False
+
+    if problema:
+        return _falhou(
+            f"liberar {quem}",
+            problema,
+            "Subi o servidor de volta. A liberacao continua pendente: mande /permitir de novo.",
+        )
+
+    pronto, alerta, _ping = await espera_pronto(ctx)
+    if alerta or not pronto:
+        # A lista esta no arquivo e o proximo boot le: a liberacao vale, mas o
+        # bot nao pode dizer que o servidor esta de pe.
+        return _relatorio(
+            f"liberar {quem}",
+            "liberacao gravada, servidor nao voltou",
+            [
+                txt.aviso(alerta or f"o BDS nao imprimiu 'Server started.' em {cfg.boot_timeout}s"),
+                "",
+                txt.campo("Arquivo", f"{quem} esta no allowlist.json e entra no proximo boot"),
+                txt.campo("Diagnostico", "docker compose logs bds"),
+            ],
+            icone=txt.AVISO,
+        )
+
+    corpo = [
+        f"{txt.OK} {quem} entrou na lista de verdade.",
+        "",
+        txt.campo("Como", "parei o servidor, gravei no allowlist.json com ele parado e subi de novo"),
+        txt.campo("Lista", "o BDS leu o arquivo no boot, entao quem mantem a lista agora e ele"),
+    ]
+    if ctx.server.tem_whitelist_json():
+        corpo += [
+            "",
+            txt.aviso(
+                "Continua um whitelist.json no /data: ele tem preferencia sobre o allowlist.json "
+                "e pode continuar mandando. Apague esse arquivo."
+            ),
+        ]
+    return _relatorio(f"liberar {quem}", "liberacao salva", corpo)
+
+
+async def agenda_liberacao(ctx: AppContext, nomes: list[str], by: int, bot: Bot) -> str:
+    """Anota a liberacao pendente e arma o 'eu reinicio em N minutos'.
+
+    O prazo e' do primeiro, nao do ultimo: um segundo /permitir no mesmo estado
+    entra na fila do reinicio que ja estava marcado, senao um jogador novo
+    empurraria a liberacao dos outros e o admin perderia o prazo que ele leu na
+    tela. Os nomes ficam no bot.db, entao um recreate do bot no meio da espera
+    nao apaga a promessa - a pendencia volta no boot seguinte.
+    """
+    for nome in nomes:
+        ctx.store.marca_liberacao(nome, by)
+    segundos = ctx.config.allowlist_grace_seconds
+    ja_rodando = ctx.tarefa_liberacao is not None and not ctx.tarefa_liberacao.done()
+    if segundos <= 0:
+        return txt.info("So pelo botao: eu nao reinicio sozinho neste servidor.")
+    if ja_rodando:
+        # Nao estica o prazo: um segundo /permitir entra na fila do reinicio que
+        # ja estava marcado, e o horario que aparece e o do primeiro.
+        return (
+            f"Ja esta marcado: eu reinicio {_prazo_texto(restante(ctx), ctx.config.tz)} assim mesmo. "
+            "Nao precisa fazer mais nada."
+        )
+    ctx.tarefa_liberacao = asyncio.create_task(_espera_liberacao(ctx, bot, segundos))
+    return (
+        f"Nao preciso da sua confirmacao: {_prazo_texto(segundos, ctx.config.tz)} eu reinicio assim "
+        "mesmo. O botao so antecipa."
+    )
+
+
+def cancela_agenda(ctx: AppContext) -> bool:
+
+    """Corta o prazo pendente (o botao do admin). Devolve True se havia um.
+
+    Sem isso o botao e o timer iam derrubar o servidor duas vezes: o timer
+    acorda, nao acha mais pendencia (o botao ja limpou) e sai com um "nada a
+    reiniciar" - ou, pior, acorda no meio do restart do botao e se atropela no
+    _restart_lock esperando a vez.
+    """
+    tarefa = ctx.tarefa_liberacao
+    if ctx.liberacao_em_curso or tarefa is None or tarefa.done():
+        return False
+    tarefa.cancel()
+    return True
+
+
+async def _espera_liberacao(ctx: AppContext, bot: Bot, segundos: int) -> None:
+    try:
+        try:
+            await asyncio.sleep(segundos)
+        except asyncio.CancelledError:
+            log.info("prazo cancelado: o admin antecipou pelo botao")
+            return
+        relatorio = await dispara_pendente(ctx)
+        await notificar(bot, ctx, relatorio)
+    except Exception:
+        # Uma task nao pode morrer em silencio: o admin precisa do relatorio
+        # (ou do log) do que o timer dele fez.
+        log.exception("falha na liberacao automatica")
+    finally:
+        ctx.tarefa_liberacao = None
+
+
+async def dispara_pendente(ctx: AppContext) -> str:
+    """Reinicia agora por causa do prazo (ou do botao). Devolve o relatorio."""
+    if ctx.liberacao_em_curso:
+        return txt.info("A liberacao ja esta em andamento: eu te aviso quando o servidor voltar.")
+    pendentes = ctx.store.liberacoes()
+    if not pendentes:
+        return txt.info("Nao ha liberacao pendente: nada a reiniciar.")
+    nomes = [r["name"] for r in pendentes]
+    by = next((r["by"] for r in pendentes if r["by"]), None)
+
+    # Antes de derrubar o servidor, pergunta. Se o console voltou e ja tem os
+    # nomes, o problema era outro (uma rede, um restart) e o downtime seria de
+    # graça.
+    erro, listadas = await asyncio.to_thread(allowlist_no_console, ctx, "list")
+    if not erro and all(confirmado(listadas, nome) for nome in nomes):
+        ctx.store.limpa_liberacoes()
+        return txt.ok(
+            "O console voltou e o servidor ja tem " + ", ".join(nomes) + ": cancelei o reinicio."
+        )
+    return await libera_reiniciando(ctx, nomes, by)
+
+
+# O menor prazo que um rearme aceita. Sem ele, um bot que subiu depois do prazo
+# estourado derrubaria o BDS no meio do boot, porque o /permitir e o boot do
+# servidor costumam acontecer juntos (compose up do bot logo apos o do BDS).
+ESPERA_MINIMA_REARME = 30
+
+
+def rearma_pendencia(ctx: AppContext, bot: Bot) -> None:
+    """Devolve a promessa do /permitir depois que o container do bot renasceu.
+
+    A task nao sobrevive a um recreate, mas o bot.db atravessa o downtime - e e
+    por isso que a pendencia mora la e nao em memoria. Sem este rearme, um
+    /permitir feito dois minutos antes do recreate nunca reiniciava: o prazo
+    sumia junto com o container e o jogador ficava na porta sem ninguem
+    prometendo nada.
+
+    O prazo continua correndo pelo `at` original (o mais antigo), e nao recomeca
+    no boot: a promessa foi "daqui a 5 minutos", e quem leu aquilo no Telegram
+    conta o tempo do relogio dele.
+    """
+    pendentes = ctx.store.liberacoes()
+    if not pendentes or ctx.config.allowlist_grace_seconds <= 0:
+        return
+    if ctx.tarefa_liberacao is not None and not ctx.tarefa_liberacao.done():
+        return
+    faltam = restante(ctx)
+    if faltam < ESPERA_MINIMA_REARME:
+        log.warning(
+            "prazo da liberacao de %s vencido ou a menos de %ds: vai reiniciar assim que der",
+            ", ".join(r["name"] for r in pendentes),
+            ESPERA_MINIMA_REARME,
+        )
+        faltam = ESPERA_MINIMA_REARME
+    ctx.tarefa_liberacao = asyncio.create_task(_espera_liberacao(ctx, bot, faltam))
+    log.info("liberacao rearmada: %s em %ds", ", ".join(r["name"] for r in pendentes), faltam)
 
 
 def _fmt_uptime(started_at: str) -> str:
@@ -303,9 +753,25 @@ async def status_lines(ctx: AppContext) -> list[str]:
         txt.campo("Visao", props.get("view-distance", "?")),
         txt.campo(
             "Lista de acesso",
-            "ligada" if props.get("allow-list") == "true" else "desligada",
+            f"{'ligada' if props.get('allow-list') == 'true' else 'desligada'} no arquivo",
         ),
     ]
+    # A propriedade so diz o que o proximo boot vai ler. Quem manda AGORA e' o
+    # runtime, entao o /status pergunta o console em vez de repetir o arquivo e
+    # chamar isso de verdade.
+    erro_lista, no_servidor = await asyncio.to_thread(allowlist_no_console, ctx, "list")
+    if erro_lista:
+        linhas_regras.append(txt.aviso(f"console mudo, nao da para confirmar: {erro_lista}"))
+    else:
+        linhas_regras.append(txt.campo("No servidor", f"{len(no_servidor)} pessoa(s) na lista carregada"))
+    pendentes = [r["name"] for r in ctx.store.liberacoes()]
+    if pendentes:
+        linhas_regras.append(
+            txt.aviso(
+                f"{len(pendentes)} liberacao(oes) nao valem ainda: {', '.join(pendentes)} "
+                f"(eu reinicio em {ctx.config.allowlist_grace_seconds}s)"
+            )
+        )
     body.append(txt.secao("⚙️", "regras do jogo") + "\n" + txt.sub(linhas_regras))
     if ping.ok and not ping.motd_ok:
         body.append(

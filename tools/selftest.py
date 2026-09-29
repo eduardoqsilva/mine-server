@@ -1145,15 +1145,83 @@ def test_allowlist() -> None:
         (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
         st = store.Store(data / "bot.db")
         srv = serverctl.ServerControl(data)
-        ctx = SimpleNamespace(store=st, server=srv)
+
+        class _Console:
+            """DockerController de mentira: responde o allowlist list como o BDS.
+
+            O codigo manda o comando inteiro numa string so
+            ("allowlist add \\"Example Name\\""), como o send-command espera, entao
+            o fake quebra em partes para saber o que responder.
+            """
+
+            def __init__(self, lista: list[str], recusa: str = "", rodando: bool = True) -> None:
+                self.lista = lista
+                self.recusa = recusa
+                self.rodando = rodando
+                self.comandos: list[str] = []
+                self.passos: list[str] = []
+
+            def state(self):
+                return SimpleNamespace(running=self.rodando, status="running" if self.rodando else "exited")
+
+            def say(self, texto: str) -> None:
+                self.passos.append("falou")
+
+            def para(self) -> None:
+                self.rodando = False
+                self.passos.append("parou")
+
+            def liga(self) -> None:
+                self.rodando = True
+                self.passos.append("subiu")
+
+            def console(self, *args: str, **kwargs) -> tuple[str, list[str]]:
+                bruto = args[0]
+                self.comandos.append(bruto)
+                if self.recusa:
+                    return self.recusa, []
+                partes = bruto.split(maxsplit=2)
+                comando = partes[1] if len(partes) > 1 and partes[0] == "allowlist" else bruto
+                nome = partes[2].strip('"') if len(partes) > 2 else ""
+                if comando == "add":
+                    if nome not in self.lista:
+                        self.lista.append(nome)
+                    return "", []
+                if comando == "remove":
+                    if nome in self.lista:
+                        self.lista.remove(nome)
+                    return "", []
+                if comando == "list":
+                    return "", list(self.lista)
+                return "", []
+
+        cfg = SimpleNamespace(
+            announce_seconds=0, boot_timeout=1, allowlist_grace_seconds=300, tz=timezone.utc
+        )
+        ctx = SimpleNamespace(
+            store=st, server=srv, config=cfg, docker=None,
+            em_restart=False, tarefa_liberacao=None, liberacao_em_curso=False,
+        )
+
+        # --- confirmar nome: nem string nem o chat podem mentir ---
+        # O bug antigo era procurar o nome com `in` em qualquer linha da janela
+        # de log. Um "Ze: ola" no chat confirmava a liberacao de um Ze que nao
+        # esta na lista - e o admin acreditava no bot.
+        check("nome exato conta", ops.confirmado(["Ze"], "Ze"))
+        check("nome com espaco e' a linha inteira", ops.confirmado(['"Ze Do Zero"'], "Ze Do Zero"))
+        check("lista com xuid conta", ops.confirmado(["Ze Do Zero (2535463291192118)"], "Ze Do Zero"))
+        check("prefixo de outro nao conta", not ops.confirmado(["Zezinho"], "Ze"))
+        check("chat com o nome nao conta", not ops.confirmado(["Ze: ola, tudo bem?"], "Ze"))
+        check("eco do comando nao conta", not ops.confirmado(['"Added Ze Do Zero"'], "Ze Do Zero"))
+        check("vazio nao confirma ninguem", not ops.confirmado([], "Ze"))
 
         # --- console responde: o caminho bom ---
         docker = _Console(["Ze"])
         ctx.docker = docker
         check("console de mentira pronto", docker.console("allowlist list")[1] == ["Ze"])
 
-        entrou, aviso = asyncio.run(ops.poe_na_lista(ctx, "Example Name"))
-        check("entrou pela lista do servidor", entrou and aviso == "", (entrou, aviso))
+        lib = asyncio.run(ops.poe_na_lista(ctx, "Example Name"))
+        check("entrou pela lista do servidor", lib.estado == ops.LIBERADO and lib.aviso == "", (lib.estado, lib.aviso))
         check("add foi pelo console", 'allowlist add "Example Name"' in docker.comandos, docker.comandos)
         check("confirmou com allowlist list", "allowlist list" in docker.comandos, docker.comandos)
         check("nome com espaco foi entre aspas", "Example Name" in docker.lista, docker.lista)
@@ -1168,28 +1236,29 @@ def test_allowlist() -> None:
 
         docker_mudo = _Mudo([])
         ctx.docker = docker_mudo
-        entrou, aviso = asyncio.run(ops.poe_na_lista(ctx, "Fantasma"))
-        check("sem confirmacao, nao diz que liberou", entrou and "nao devolveu o nome" in aviso, (entrou, aviso))
+        lib = asyncio.run(ops.poe_na_lista(ctx, "Fantasma"))
+        check("sem confirmacao, nao diz que liberou", lib.estado == ops.LIBERADO_PENDENTE, lib.estado)
+        check("e diz que o console nao devolveu o nome", "nao devolveu o nome" in lib.aviso, lib.aviso)
 
-        # --- console recusado com o servidor RODANDO: o arquivo nao segura ---
+        # --- console recusado com o servidor RODANDO: so o reinicio salva ---
         # O BDS reescreve o allowlist.json quando desliga, a partir da lista
         # que ele tem em memoria. Se o console nao responde, a entrada no
-        # arquivo morre no proximo stop - e mandar reiniciar seria o jeito
-        # certo de perder a edicao. O aviso tem que dizer isso.
+        # arquivo morre no proximo stop - e por isso que o /permitir agenda o
+        # reinicio em vez de mandar o admin reiniciar na mao.
         recusa = "ERROR: failed to search for bedrock server process"
         ctx.docker = _Console([], recusa=recusa, rodando=True)
-        entrou, aviso = asyncio.run(ops.poe_na_lista(ctx, "Bia"))
-        check("fallback grava no arquivo", entrou, (entrou, aviso))
-        check("fallback avisa que o restart apagaria", "apagaria a entrada" in aviso, aviso)
-        check("fallback nao manda reiniciar", "/reiniciar" not in aviso, aviso)
+        lib = asyncio.run(ops.poe_na_lista(ctx, "Bia"))
         salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
-        check("arquivo tem a entrada no formato do BDS", salvos == [{"ignoresPlayerLimit": False, "name": "Bia"}], salvos)
+        check("fallback grava no arquivo no formato do BDS", {"ignoresPlayerLimit": False, "name": "Bia"} in salvos, salvos)
+        check("fallback fica pendente, nao liberado", lib.estado == ops.LIBERADO_PENDENTE, lib.estado)
+        check("fallback avisa que nao vale ainda", "nao vale" in lib.aviso, lib.aviso)
+        check("fallback diz o erro do console", "failed to search" in lib.aviso, lib.aviso)
 
         # --- console recusado com o servidor PARADO: ai o boot resolve ---
         ctx.docker = _Console([], recusa=recusa, rodando=False)
-        entrou, aviso = asyncio.run(ops.poe_na_lista(ctx, "Caio"))
-        check("servidor parado: o boot le o arquivo", "proximo boot ja le isso" in aviso, aviso)
-        check("e diz o motivo do console", "failed to search" in aviso, aviso)
+        lib = asyncio.run(ops.poe_na_lista(ctx, "Caio"))
+        check("servidor parado: o boot le o arquivo", lib.estado == ops.LIBERADO_BOOT, lib.estado)
+        check("e diz o motivo do console", "failed to search" in lib.aviso, lib.aviso)
 
         # remover tambem passa pelo console quando ele existe
         docker_ok = _Console(["Bia", "Ze"])
@@ -1205,11 +1274,200 @@ def test_allowlist() -> None:
         check("guardou o override", st.overrides().get("allow-list") == "true", st.overrides())
         check("avisa que ligou agora", "ja vem ligada" in aviso, aviso)
 
-        # ja ligada no arquivo e no override: nao ha o que fazer
+        # Ja true no arquivo: o 'allowlist on' continua sendo enviado. O BDS
+        # reescreve allow-list no shutdown a partir do runtime, e ele pode ter
+        # virado false num boot em que o arquivo ainda era false - confiar so
+        # no arquivo era o jeito de o bot achar que a lista estava no ar sem
+        # ela estar.
         docker_ok2 = _Console([])
         ctx.docker = docker_ok2
         aviso = asyncio.run(ops.liga_a_lista(ctx, 42))
-        check("lista ja ligada nao repete trabalho", aviso == "" and docker_ok2.comandos == [], (aviso, docker_ok2.comandos))
+        check("arquivo true ainda manda allowlist on", docker_ok2.comandos == ["allowlist on"], docker_ok2.comandos)
+        check("e nao repete a escrita", aviso == "", aviso)
+
+        # --- estado_real: as tres fontes lado a lado ---
+        # Um nome no arquivo que o servidor nao tem e' o bug escrito na tela.
+        (data / "allowlist.json").write_text(
+            json.dumps([{"name": "Bia", "xuid": "1"}, {"name": "SoNoArquivo"}]), encoding="utf-8"
+        )
+        (data / "whitelist.json").write_text("[]\n", encoding="utf-8")
+        ctx.docker = _Console(["Bia"])
+        estado = ops.estado_real(ctx)
+        check("estado_real le o console", estado.linhas_servidor == ["Bia"], estado.linhas_servidor)
+        check("acha quem so esta no arquivo", estado.so_no_arquivo() == ["SoNoArquivo"], estado.so_no_arquivo())
+        check("e ve o whitelist.json", estado.whitelist_antigo is True, estado.whitelist_antigo)
+        (data / "whitelist.json").unlink()
+
+        # console fora do ar: sem ele o bot nao afirma divergencia nenhuma
+        ctx.docker = _Console([], recusa=recusa)
+        estado = ops.estado_real(ctx)
+        check("sem console, nao inventa divergencia", estado.so_no_arquivo() == [], estado.so_no_arquivo())
+        check("mas guarda o erro", "failed to search" in estado.erro_console, estado.erro_console)
+
+        # --- o reinicio que faz a liberacao valer ---
+        # A ordem e' o mecanismo: para, escreve, sobe. Escrever antes do stop
+        # seria o jeito certo de perder a entrada, porque o BDS reescreve o
+        # arquivo no shutdown.
+        srv.add_allowlist("Bia")
+        srv.add_allowlist("Caio")
+        st.limpa_liberacoes()
+        st.marca_liberacao("Bia", 42)
+        st.marca_liberacao("Caio", 42)
+
+        original_espera = ops.espera_pronto
+
+        async def espera_falsa(ctx):
+            return True, "", SimpleNamespace(jogadores=0)
+
+        ops.espera_pronto = espera_falsa
+        try:
+            docker_seq = _Console(["Bia", "Caio"], recusa=recusa, rodando=True)
+            ctx.docker = docker_seq
+            escrever = srv.add_allowlist
+
+            def add_rastreado(nome, xuid=None, log_txt=None):
+                docker_seq.passos.append(f"escreveu {nome}")
+                return escrever(nome, xuid, log_txt)
+
+            srv.add_allowlist = add_rastreado
+            try:
+                relatorio = asyncio.run(ops.libera_reiniciando(ctx, ["Bia", "Caio"], 42))
+            finally:
+                srv.add_allowlist = escrever
+            check("parou antes de escrever", docker_seq.passos.index("parou") < docker_seq.passos.index("escreveu Bia"), docker_seq.passos)
+            check("escreveu antes de subir", docker_seq.passos.index("escreveu Caio") < docker_seq.passos.index("subiu"), docker_seq.passos)
+            check("relatorio diz que entraram de verdade", "entrou na lista de verdade" in relatorio, relatorio)
+            check("nao sobrou pendencia", st.liberacoes() == [], st.liberacoes())
+            check("em_restart voltou a False", ctx.em_restart is False, ctx.em_restart)
+
+            # se o console voltar a listar todo mundo, o timer nao reinicia
+            docker_ja_tem = _Console(["Bia", "Caio"])
+            ctx.docker = docker_ja_tem
+            st.marca_liberacao("Bia", 42)
+            relatorio = asyncio.run(ops.dispara_pendente(ctx))
+            check("timer cancela se o servidor ja tem", "cancelei o reinicio" in relatorio, relatorio)
+            check("e nao derrubou o servidor", docker_ja_tem.passos == [], docker_ja_tem.passos)
+            check("e limpou a pendencia", st.liberacoes() == [], st.liberacoes())
+
+            # o botao antecipa: cancela o prazo e reinicia na hora
+            docker_botao = _Console([], recusa=recusa, rodando=True)
+            ctx.docker = docker_botao
+            st.marca_liberacao("Bia", 42)
+
+            class _TaskFalsa:
+                """So o que cancela_agenda olha: se terminou e o cancel()."""
+
+                def done(self) -> bool:
+                    return False
+
+                def cancel(self) -> None:
+                    self.cancelado = True
+
+            ctx.tarefa_liberacao = _TaskFalsa()
+            check("botao corta o prazo", ops.cancela_agenda(ctx) is True)
+            relatorio = asyncio.run(ops.dispara_pendente(ctx))
+            check("botao reinicia de uma vez", "parou" in docker_botao.passos, docker_botao.passos)
+            check("e o relatorio e' o da liberacao", "entrou na lista de verdade" in relatorio, relatorio)
+
+            # o timer sozinho: e' a promessa que o /permitir faz, entao ela
+            # precisa valer mesmo sem ninguem apertar botao
+            docker_timer = _Console([], recusa=recusa, rodando=True)
+            ctx.docker = docker_timer
+            ctx.tarefa_liberacao = None
+            st.limpa_liberacoes()
+            cfg.allowlist_grace_seconds = 1
+            avisados = []
+
+            class _Bot:
+                async def send_message(self, chat_id, texto):
+                    avisados.append((chat_id, texto))
+
+            st.define_admin(777, "dono")
+
+            async def espera_o_timer():
+                await ops.agenda_liberacao(ctx, ["Sem Botao"], 42, _Bot())
+                await ctx.tarefa_liberacao
+
+            asyncio.run(espera_o_timer())
+            check("o timer reiniciou sozinho", "parou" in docker_timer.passos, docker_timer.passos)
+            check("e avisou o admin", any("Sem Botao" in t for _c, t in avisados), avisados)
+            check("a task se limpou sozinha", ctx.tarefa_liberacao is None, ctx.tarefa_liberacao)
+            cfg.allowlist_grace_seconds = 300
+        finally:
+            ops.espera_pronto = original_espera
+
+        # --- o prazo ---
+        # Tudo num unico asyncio.run: a task do prazo e' criada dentro do loop
+        # que a roda, e um asyncio.run que devolve ja cancela e fecha o loop
+        # dela. Espalhar isso em varios asyncio.run mediria o asyncio, e nao o
+        # prazo.
+        st.limpa_liberacoes()
+
+        class _Bot2(_Bot):
+            pass
+
+        async def cenario_prazo() -> None:
+            cfg.allowlist_grace_seconds = 0
+            aviso = await ops.agenda_liberacao(ctx, ["Bia"], 42, _Bot2())
+            check("prazo 0 nao promete reinicio", "So pelo botao" in aviso, aviso)
+            check("mas a pendencia fica marcada", [r["name"] for r in st.liberacoes()] == ["Bia"], st.liberacoes())
+            check("e nenhuma task foi criada", ctx.tarefa_liberacao is None, ctx.tarefa_liberacao)
+
+            cfg.allowlist_grace_seconds = 300
+            aviso = await ops.agenda_liberacao(ctx, ["Caio"], 42, _Bot2())
+            check("o prazo e' informado", "5 min" in aviso and "reinicio assim mesmo" in aviso, aviso)
+            check("task de espera criada", ctx.tarefa_liberacao is not None)
+            # o prazo corre da primeira marcacao, e nao da ultima: e o que faz
+            # a hora mostrada na tela ser a mesma que o timer vai cumprir
+            check("o prazo comeca agora", 299 <= ops.restante(ctx) <= 300, ops.restante(ctx))
+            await asyncio.sleep(1.1)
+            aviso = await ops.agenda_liberacao(ctx, ["Bia"], 42, _Bot2())
+            check("segundo /permitir nao estica o prazo", "Ja esta marcado" in aviso, aviso)
+            check("e o relogio continua andando", 297 <= ops.restante(ctx) <= 299, ops.restante(ctx))
+            check(
+                "as duas pendencias estao marcadas",
+                sorted(r["name"] for r in st.liberacoes()) == ["Bia", "Caio"],
+                st.liberacoes(),
+            )
+            check("botao cancela o prazo de verdade", ops.cancela_agenda(ctx) is True)
+            await asyncio.sleep(0.01)
+            # cancel() em task que nem chegou a rodar a primeira vez joga o
+            # CancelledError no inicio do corpo, antes do try: a tarefa morre e
+            # o finally nem roda. O que importa e' que ela nao volte a contar.
+            check(
+                "a task cancelada morre",
+                ctx.tarefa_liberacao is None or ctx.tarefa_liberacao.done(),
+                ctx.tarefa_liberacao,
+            )
+            st.limpa_liberacoes()
+
+        asyncio.run(cenario_prazo())
+
+        # --- sobreviver a um restart do bot ---
+        # A task morre com o container, mas a promessa esta no bot.db: o boot
+        # seguinte rearma o prazo que faltava, em vez de sumir com ele.
+        async def cenario_rearme() -> bool:
+            st.marca_liberacao("Bia", 42)
+            ops.rearma_pendencia(ctx, _Bot2())
+            armado = ctx.tarefa_liberacao is not None
+            ops.cancela_agenda(ctx)
+            await asyncio.sleep(0.01)
+            st.limpa_liberacoes()
+            return armado
+
+        check("rearmou depois do boot", asyncio.run(cenario_rearme()))
+
+        async def cenario_prazo_zero() -> bool:
+            cfg.allowlist_grace_seconds = 0
+            st.marca_liberacao("Bia", 42)
+            antes = ctx.tarefa_liberacao
+            ops.rearma_pendencia(ctx, _Bot2())
+            cfg.allowlist_grace_seconds = 300
+            nada = ctx.tarefa_liberacao is antes
+            st.limpa_liberacoes()
+            return nada
+
+        check("prazo 0 nao rearma nada", asyncio.run(cenario_prazo_zero()))
 
         st.fecha()
 

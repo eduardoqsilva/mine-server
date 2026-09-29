@@ -83,6 +83,7 @@ class Config:
     update_minute: int
     announce_seconds: int
     boot_timeout: int
+    allowlist_grace_seconds: int
     backup_keep: int
     max_upload_bytes: int
     tz: ZoneInfo
@@ -131,6 +132,11 @@ class Config:
             update_minute=_int("UPDATE_MINUTE", 0),
             announce_seconds=_int("ANNOUNCE_SECONDS", 20),
             boot_timeout=_int("BOOT_TIMEOUT", 240),
+            # Quanto o /permitir espera antes de reiniciar sozinho quando so
+            # deu para gravar no allowlist.json. O botao do Telegram antecipa;
+            # este e o prazo maximo, e o que segura a promessa de que a
+            # liberacao vai entrar de vez. 0 = nunca reiniciar sozinho.
+            allowlist_grace_seconds=_int("ALLOWLIST_GRACE_SECONDS", 300),
             backup_keep=_int("BACKUP_KEEP", 3),
             max_upload_bytes=_int("MAX_UPLOAD_BYTES", TELEGRAM_DOWNLOAD_LIMIT),
             tz=ZoneInfo(os.getenv("TZ", "America/Sao_Paulo")),
