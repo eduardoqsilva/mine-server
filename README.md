@@ -56,16 +56,29 @@ Depois:
 
 ```bash
 mkdir -p data state
+ufw allow 19132/tcp; ufw allow 7551/udp; ufw allow 19133:19172/udp
 docker compose config      # revisa o que vai subir
 docker compose up -d --build
 docker compose logs -f bot
 ```
+
+As tres regras de firewall sao obrigatorias, nao um extra: o `bds` roda em
+`network_mode: host`, entao quem precisa abrir a porta e o host, e sem elas o
+servidor sobe perfeito e ninguem entra. O painel do provedor costuma ter um
+firewall proprio, que e separado deste.
 
 O primeiro `/start` no Telegram mostra como entrar. Sem o codigo, o log do bot
 explica o que faltou:
 
 ```bash
 docker compose logs bot | tail -20
+```
+
+Para confirmar que subiu certo, sem depender do Telegram:
+
+```bash
+docker inspect -f '{{.HostConfig.NetworkMode}}' mine-bedrock   # host
+curl -s http://127.0.0.1:19132/v1/join                        # JSON
 ```
 
 ## Quem pode usar o bot

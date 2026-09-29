@@ -7,7 +7,8 @@ Usado em dois lugares:
 Duas situacoes que o ping denuncia:
   - pong com o payload "MCPE;..."  -> tudo certo, jogadores veem o nome/versao;
   - pong de 33 bytes sem payload   -> bug do Mojang MCPE-239705, o cliente da
-    timeout. O ENABLE_LAN_VISIBILITY=true contorna; se aparecer aqui, avise.
+    timeout. Nao tem contorno no compose: o ENABLE_LAN_VISIBILITY esta "false"
+    de proposito. Se aparecer, e bug do Mojang mesmo - avise.
 
 Sobre o nethernet: no BDS 1.26.52+ ele e o unico transporte suportado
 (o servidor aborta a conexao se transport=raknet) e responde ao unconnected

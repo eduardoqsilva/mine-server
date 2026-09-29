@@ -185,8 +185,8 @@ async def status_lines(ctx: AppContext) -> list[str]:
     if ping.ok and not ping.motd_ok:
         body.append(
             txt.aviso(
-                "Pong sem MCPE;... - bug do Mojang (itzg#649). "
-                "Com ENABLE_LAN_VISIBILITY=true os clientes conectam mesmo assim."
+                "Pong sem MCPE;... - bug conhecido do Mojang (itzg#649), que o "
+                "cliente entende como timeout. Nao ha contorno no compose."
             )
         )
 

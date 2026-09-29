@@ -39,11 +39,15 @@ services:
       # level-name. Quem manda no nome da pasta do mundo e o compose; o bot
       # avisa isso no /config level-name.
       LEVEL_NAME: "${LEVEL_NAME:-world}"
-      # Workaround do bug de pong do Mojang (BDS >= 1.26.30 devolve 33 bytes
-      # sem "MCPE;", issue itzg#649). Fuerza o caminho de handshake LAN, que
-      # responde certo. Efeito colateral: o BDS passa a bindar 19132/19133
-      # (as portas padrao) - irrelevante aqui, que so roda um servidor.
-      ENABLE_LAN_VISIBILITY: "true"
+      # OFF de proposito. Isto e' o servidor responder a quem procura servidores
+      # na LAN. Numa VPS publica nao serve pra nada e vaza o servidor para
+      # qualquer rede em que alguem se plugue (wifi de cafe, rede do vizinho).
+      #
+      # Ja foi workaround do bug de pong de 33 bytes (itzg#649), mas esse bug
+      # era do raknet e nao existe no nethernet, que e' o transporte desta
+      # versao. Conferido com "false": o signalling fica identico - o log
+      # continua "Accepting clients on [::]:19132" e o /v1/join devolve 200.
+      ENABLE_LAN_VISIBILITY: "false"
       CONTENT_LOG_FILE_ENABLED: "true"
       CONTENT_LOG_LEVEL: "info"
       # O aviso de desligamento e do bot (ele sabe o motivo: atualizacao, pack
