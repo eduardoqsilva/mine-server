@@ -58,12 +58,6 @@ services:
       # abaixo cobre o caso do SIGKILL.
       STOP_SERVER_ANNOUNCE_DELAY: "0"
       OPS: "${OPS:-}"
-      # So se a rede host NAO bastar (NAT do provedor sem porta fixa, ou
-      # servidor com mais de um IP). Fixa o IP que o nethernet anuncia como
-      # candidato, e' o que o cliente tenta. Vazio = o BDS escolhe sozinho a
-      # partir das interfaces do host, que e' o certo na maioria dos casos.
-      # Custo: com o IP fixado, quem estiver na mesma LAN deixa de entrar.
-      SERVER_IP: "${SERVER_IP:-}"
     network_mode: host
     # SEM bloco `ports:` de proposito. O nethernet (BDS 1.26.51+) nao e so
     # "abrir a porta": o servidor sorteia os candidatos ICE a partir das

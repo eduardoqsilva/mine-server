@@ -137,9 +137,22 @@ Os jogadores entram em **Adicionar servidor -> Endereço -> `seu.dominio`**.
 > socket de gameplay so aparece no `/proc/net/udp6` enquanto alguem esta
 > conectando - entao a faixa so da para conferir com o jogo aberto.
 >
-> Se a rede host nao bastar (NAT do provedor sem porta fixa, maquina com varios
-> IPs), da para fixar o IP anunciado com `SERVER_IP=<ip-publico>` no `.env`.
-> O preco: com o IP fixado, quem estiver na mesma LAN deixa de entrar.
+> **VPS atras de NAT (IP publico nao aparece no `ip addr`).** E' o caso da
+> OVH Public Cloud: a maquina tem so o IP privado na interface e o publico e um
+> NAT 1:1 no edge. A rede host resolve o problema de *interface*, mas o
+> nethernet passa a anunciar o IP privado, que ninguem de fora alcanca. A
+> correcao nao e mexer no `server-ip` (que e endereco de *bind*: se voce
+> preencher com um IP que nao e local, o BDS nem sobe), e sim no
+> `server-udp-ports`, dizendo o IP publico:
+>
+> ```
+> /config server-udp-ports=<IP-PUBLICO>:19133-19172:19133-19172
+> ```
+>
+> Continua valendo o 1:1 (externo tem que ser igual a interno). Se a faixa
+> larga nao funcionar, liste portas avulsas:
+> `<IP-PUBLICO>:19133:19133,<IP-PUBLICO>:19134:19134`.
+> E o edge do provedor precisa deixar passar a faixa UDP, senao nao adianta.
 
 ## Sobre o icone
 
