@@ -38,6 +38,38 @@ def _segredo(name: str, ajuda: str) -> str:
 
 
 @dataclass(frozen=True)
+class DropboxConfig:
+    """Credencial do Dropbox, lida do .env.
+
+    Deliberadamente solta no dataclass Config: sao credenciais, nao
+    configuracao de comportamento, e ficao num objeto so para o backup poder
+    dizer "sem credencial do Dropbox" sem precisar checar quatro variaveis.
+    """
+
+    token: str = ""
+    refresh_token: str = ""
+    app_key: str = ""
+    app_secret: str = ""
+
+    @classmethod
+    def from_env(cls) -> "DropboxConfig":
+        return cls(
+            token=os.getenv("DROPBOX_TOKEN", "").strip(),
+            refresh_token=os.getenv("DROPBOX_REFRESH_TOKEN", "").strip(),
+            app_key=os.getenv("DROPBOX_APP_KEY", "").strip(),
+            app_secret=os.getenv("DROPBOX_APP_SECRET", "").strip(),
+        )
+
+    def resumo(self) -> str:
+        """Como mostrar o estado sem vazar o segredo."""
+        if self.refresh_token and self.app_key and self.app_secret:
+            return "refresh token (renova sozinho)"
+        if self.token:
+            return "so token fixo (expira em ~4h, o backup semanal vai falhar)"
+        return "nao configurado"
+
+
+@dataclass(frozen=True)
 class Config:
     token: str
     admin_claim_code: str
@@ -56,9 +88,16 @@ class Config:
     tz: ZoneInfo
     staging_dir: Path
     icon_file: Path
+    backups_dir: Path
+    backup_local_keep: int
+    backup_dropbox_keep: int
+    backup_day: int
+    backup_hour: int
+    backup_minute: int
+    dropbox: DropboxConfig
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token or token in _PLACEHOLDERS:
             raise ConfigError(
@@ -99,4 +138,16 @@ class Config:
             # O Bedrock ignora server-icon.png (recursos do Java edition), entao
             # o icone vive aqui para o bot mandar no /status do Telegram.
             icon_file=Path(os.getenv("ICON_FILE", "/app/assets/server-icon.png")),
+            backups_dir=Path(os.getenv("BACKUPS_DIR", "/state/backups")),
+            # 5 no disco (virada rapida se o Dropbox estiver fora) e 3 na nuvem
+            # (e o espaco apertado la). Os dois sao apagados por rotacao, nunca
+            # por data.
+            backup_local_keep=_int("BACKUP_LOCAL_KEEP", 5),
+            backup_dropbox_keep=_int("BACKUP_DROPBOX_KEEP", 3),
+            # Sabado as 04:00: uma hora antes do restart das 05:00 que busca a
+            # versao nova, para os dois nao cairem no mesmo dia colados.
+            backup_day=_int("BACKUP_DAY", 5),
+            backup_hour=_int("BACKUP_HOUR", 4),
+            backup_minute=_int("BACKUP_MINUTE", 0),
+            dropbox=DropboxConfig.from_env(),
         )

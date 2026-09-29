@@ -13,7 +13,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from . import ops, serverctl, txt
+from . import backup, ops, serverctl, txt
 from .auth import AdminOnly
 from .ops import AppContext
 
@@ -62,6 +62,8 @@ AJUDA_ADMIN = "\n".join(
                 "/reiniciar [motivo]  - reinicia o servidor",
                 "/anunciar <texto>  - fala no chat do jogo",
                 "/console <comando>  - comando no console do BDS, com a resposta",
+                "/backup  - salva o mundo de agora e manda o link",
+                "/backups  - o que existe de backup, sem copiar nada",
                 "/log [n]  - ultimas linhas do log",
                 "/auditoria  - ultimas acoes registradas",
             ]
@@ -628,6 +630,65 @@ async def cmd_console(message: Message, command: CommandObject, ctx: AppContext)
 
 
 LOG_LIMITE = 3700
+
+
+@router.message(Command("backups"))
+async def cmd_backups(message: Message, ctx: AppContext) -> None:
+    """So informa o que existe. Nao para o servidor, nao copia nada."""
+    await message.answer(_clip(ops.status_backup(ctx)))
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message, ctx: AppContext) -> None:
+    """Salva o mundo e a config do estado de agora e manda o link.
+
+    Derruba o servidor por ~1min, avisa o jogo antes e volta sozinho. A
+    espera e o usuario, nao o bot: o /backup manual e o backup semanal
+    chamam a MESMA funcao, entao o que voce ve aqui e o que roda sozinho
+    toda semana.
+    """
+    estado = await asyncio.to_thread(ctx.docker.state)
+    if not estado.running:
+        await message.answer(
+            "\n".join(
+                [
+                    txt.erro("O servidor ja esta fora do ar."),
+                    "",
+                    txt.sub(["Nada a salvar: backup e do estado de agora."]),
+                ]
+            )
+        )
+        return
+    await message.answer(
+        "\n".join(
+            [
+                txt.info("Salvando o mundo. O jogo sai do ar por instantes."),
+                "",
+                # sem numero: o aviso vai uns segundos, mas o container leva
+                # dois a tres minutos pra subir de novo, e um "~80s" que vira
+                # 200s e pior do que nao prometer nada
+                txt.sub(["Aviso no jogo, copia, e o servidor volta. Depois mando o link."]),
+            ]
+        )
+    )
+    try:
+        registro, relatorio = await ops.cria_backup(ctx, "backup pedido no Telegram")
+    except backup.BackupError as exc:
+        ctx.store.audita(message.from_user.id, "backup", f"falhou: {exc}"[:200])
+        await message.answer(
+            "\n".join(
+                [
+                    txt.erro("O backup falhou."),
+                    "",
+                    str(exc),
+                    "",
+                    txt.sub(["Se o servidor nao voltou, veja: docker compose ps"]),
+                ]
+            )
+        )
+        return
+    ctx.store.audita(message.from_user.id, "backup", f"{registro.nome} ({registro.tamanho} bytes)")
+    await message.answer(_clip(relatorio))
 
 
 @router.message(Command("log"))

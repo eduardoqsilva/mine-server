@@ -153,6 +153,8 @@ tela de packs do cliente.
 | `/reiniciar [motivo]` | reinicia o servidor (com aviso no jogo) |
 | `/anunciar <texto>` | fala no chat do jogo |
 | `/console <comando>` | manda um comando no console do BDS e devolve a resposta |
+| `/backup` | salva o mundo de agora e devolve o link do Dropbox |
+| `/backups` | o que existe de backup, sem copiar nada |
 | `/log [n]` | ultimas linhas do log (padrao 60, max 1000) |
 | `/auditoria` | ultimas acoes registradas no banco |
 | `/packs` | packs instalados |
@@ -160,6 +162,113 @@ tela de packs do cliente.
 
 O `/removerpack` sem argumento mostra a lista; clicar num pack ainda pede
 confirmacao, e a remocao reinicia o servidor uma unica vez.
+
+## Backup
+
+O `/backup` salva o estado de agora: o mundo, os packs instalados, a config
+(`server.properties`, allow-list, permissions) e o `bot.db` do bot. Ele
+**derruba o servidor por cerca de um minuto**, avisa o jogo antes e volta
+sozinho — se algo der errado, o container é religado de qualquer jeito.
+
+O que não entra no backup, de propósito:
+
+- **o binário do BDS** (`bedrock_server-*`): são 245 MB dos 411 MB do `/data`,
+  e o `bedrock-entry.sh` rebaixa sozinho no boot
+- os `server.properties.*.bak`: o arquivo atual já vai, e o histórico não
+  vale 16 KB de banda
+- o `content_log.txt`: é log, e o próprio bot tem `/log`
+
+O tar é `.tar.gz` com prefixo `data/` e `state/`, então restaurar é extrair
+por cima do volume. Formato de nome `mine-bedrock-<AAAAMMDD>T<hhmm>Z.tar.gz`,
+em UTC, para ordenar por tempo mesmo que o servidor mude de fuso.
+
+**Onde cada coisa fica:**
+
+| Onde | Quantos | Quem apaga |
+| --- | --- | --- |
+| `./state/backups/atuais` (VPS) | 5 (`BACKUP_LOCAL_KEEP`) | o mais velho a cada backup novo |
+| `/backups` (Dropbox) | 3 (`BACKUP_DROPBOX_KEEP`) | o mais velho a cada upload novo |
+
+A rotação é por contagem, não por data: o número de arquivos fica sempre no
+teto e o disco não cresce. A limpeza no Dropbox só toca em arquivo que começa
+com `mine-bedrock-`, então se você jogar outra coisa na pasta `/backups` do
+Dropbox ela fica intacta.
+
+**Backup automático:** sábado às 04:00, uma hora antes do auto-update das
+05:00 para os dois reinícios não caírem no mesmo dia colados. Ajuste com
+`BACKUP_DAY` (0=segunda … 6=domingo), `BACKUP_HOUR` e `BACKUP_MINUTE`. O
+servidor estar parado no horário pula o backup e avisa em vez de esperar.
+
+**O link:** o arquivo vai para o Dropbox e o bot responde com um link
+compartilhado permanente — o temporário do Dropbox expira em 4 horas, o que
+não serve para olhar o backup no dia seguinte. Se o Dropbox estiver fora do
+ar, o backup local é gravado do mesmo jeito e o bot te diz o caminho para
+copiar por SSH: perder a nuvem não custa o backup.
+
+**Cuidado com o link:** ele é criado com visibilidade pública, que é o padrão
+da API do Dropbox. O `.tar.gz` tem o mundo inteiro e o `bot.db` com a lista de
+admins e o histórico de auditoria, então quem tiver a URL baixa o backup —
+vale não repassar o link. Se quiser travar isso, dá para pedir um link com
+senha em vez de público.
+
+O `/backup` precisa de credencial no `.env` (`DROPBOX_REFRESH_TOKEN`,
+`DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`). O passo a passo para gerar está no
+`.env.example` — ele lista as cinco permissões de escopo que a app precisa.
+Para conferir se estão todas de pé, sem esperar um backup de verdade:
+
+```bash
+python tools/dropbox_check.py
+```
+
+O comando começa perguntando ao próprio Dropbox quais escopos o token
+carrega. Isso importa porque "permissão faltando" quase nunca é problema de
+token: quem decide a lista de escopos é a configuração da app, e um token
+recém-criado sai com a mesma lista de escopos do token anterior. Se o
+`dropbox_check.py` mostrar que o token não tem nenhum dos cinco, o conserto
+está na aba **Permissions** da app — não em trocar o código de novo.
+
+Sem credencial o resto tudo funciona, menos o link.
+
+**Sobre a credencial:** o `refresh_token` é o que o bot usa, e ele não
+expira. O `access_token` dura 4 horas — se você colocar só ele no `.env`, o
+backup funciona nas primeiras horas e depois falha em silêncio, bem longe de
+um backup. Por isso o `/backups` mostra qual dos dois está em uso.
+
+E não procure o `refresh_token` no App Console: o botão **Generate** da seção
+OAuth 2 da app só emite um access token, e é para isso que ele serve. O
+refresh token não tem botão — ele aparece na resposta da troca do código de
+autorização, que é o que o `tools/dropbox_token.py` faz por você:
+
+```bash
+python tools/dropbox_token.py APP_KEY APP_SECRET CODIGO --salvar
+```
+
+O `--salvar` faz o script escrever as três linhas no `.env` sozinho, e é o
+jeito recomendado: colar na mão é exatamente onde esse processo costuma
+falhar, com o token velho ficando no arquivo sem ninguém perceber. Sem a
+flag, o script só imprime as linhas para você colar.
+
+O `CODIGO` vem da URL de autorização que o `.env.example` traz, com
+`token_access_type=offline` — sem esse parâmetro o Dropbox não devolve
+refresh token nenhum.
+
+**Sobre o servidor parar:** copiar um mundo enquanto o BDS escreve nele pode
+produzir um arquivo que abre sem erro e só falha na hora de restaurar. Por
+isso a ordem é sempre avisar → parar → copiar → subir. Se o mundo ainda
+estiver travado pelo LevelDB logo após o stop, o bot tenta de novo três
+vezes e, se não conseguir, **falha em vez de arquivar um mundo pela metade**.
+
+**Sobre restaurar:** não existe comando de restauração ainda. Para voltar um
+backup, pare o servidor e extraia o tar por cima do `./data` e do `./state`:
+
+```bash
+docker compose stop bds
+tar -xzf state/backups/atuais/mine-bedrock-AAAAMMDDThhmmZ.tar.gz -C .
+docker compose start bds
+```
+
+Restaure também o `state/bot.db` se quiser voltar as chaves de acesso, os
+overrides do `/config` e a auditoria.
 
 **Sobre o `/console`**: e a vala de escape do `/config`. Qualquer palavra que o
 BDS aceite vai direto pro console — `list`, `help`, `tps`,

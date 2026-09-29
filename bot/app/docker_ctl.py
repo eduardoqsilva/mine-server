@@ -168,6 +168,24 @@ class DockerController:
         self._container().restart(timeout=timeout)
         log.info("container reiniciado")
 
+    def para(self, timeout: int = 110) -> None:
+        """Desliga o container preservando o mundo.
+
+        timeout < stop_grace_period (120s) de proposito: o "stop" do entry
+        script roda em 20s e o resto da margem cobre o caso do SIGKILL, onde
+        a morte so acontece depois de o tempo estourar.
+
+        Diferente de restart() porque o backup precisa de uma janela parada
+        de verdade, e nao de um stop seguido de start que outro restart
+        poderia interromper no meio do tar.
+        """
+        self._container().stop(timeout=timeout)
+        log.info("container parado")
+
+    def liga(self) -> None:
+        self._container().start()
+        log.info("container ligado")
+
     def pull_image(self) -> None:
         """Baixa a imagem nova sem recriar o container (vale no proximo up -d)."""
         try:

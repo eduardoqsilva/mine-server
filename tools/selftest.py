@@ -5,11 +5,13 @@ Roda em qualquer maquina:  python tools/selftest.py
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import sys
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -72,7 +74,9 @@ if "docker" not in sys.modules:
 
 from app import addons  # noqa: E402
 from app import auth  # noqa: E402
+from app import backup  # noqa: E402
 from app import docker_ctl  # noqa: E402
+from app import dropbox  # noqa: E402
 from app import ops  # noqa: E402
 from app import raknet  # noqa: E402
 from app import serverctl  # noqa: E402
@@ -911,6 +915,472 @@ def test_console() -> None:
     check("nada novo devolve vazio", docker_ctl._delta(["A", "B"], ["A", "B"]) == [])
 
 
+def test_dropbox() -> None:
+    print("\ndropbox: cliente HTTP")
+    chamadas: list[tuple[str, bytes]] = []
+    chamadas_arg: list[tuple[str, str]] = []
+
+    class Fake:
+        """Responde como o Dropbox, guardando o que foi pedido."""
+
+        def __init__(self) -> None:
+            self.renovadas = 0
+            self.headers: list[dict] = []
+
+        def __call__(self, url: str, *, body=None, headers=None, timeout=300.0) -> bytes:
+            chamadas.append((url, body or b""))
+            # nas rotas de upload o corpo e o arquivo, e o argumento vai no
+            # header Dropbox-API-Arg. Sem isso o teste estaria lendo JSON de
+            # onde tem binario e o erro seria meu, nao do codigo.
+            chamadas_arg.append((url, (headers or {}).get("Dropbox-API-Arg", "")))
+            self.headers.append(dict(headers or {}))
+            if url.endswith("/oauth2/token"):
+                self.renovadas += 1
+                return b'{"access_token":"acc1","expires_in":14400}'
+            if url.endswith("/list_folder"):
+                # a lista e a mesma em toda chamada: o teste nao simula o
+                # efeito do delete, e o que importa aqui e quais nomes a
+                # rotacao escolhe, nao o estado da pasta depois
+                return b'{"entries":[' + b",".join(
+                        json.dumps(
+                            {
+                                ".tag": "file",
+                                "name": n,
+                                "path_display": f"/backups/{n}",
+                                "size": 100,
+                            }
+                        ).encode()
+                        for n in (
+                            "mine-bedrock-20260101T000000Z.tar.gz",
+                            "mine-bedrock-20260108T000000Z.tar.gz",
+                            "mine-bedrock-20260115T000000Z.tar.gz",
+                            "arquivo-do-usuario.txt",
+                        )
+                    ) + b'],"has_more":false}'
+            if url.endswith("/delete_v2"):
+                return b'{"metadata":{}}'
+            if url.endswith("/create_shared_link_with_settings"):
+                return b'{"url":"https://dropbox.example/bkp"}'
+            if url.endswith("/upload_session/start"):
+                return b'{"session_id":"sess-1"}'
+            if url.endswith(("/append_v2", "/finish")):
+                return b"{}"
+            raise AssertionError(f"rota inesperada: {url}")
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        # arquivo maior que um chunk, para exercitar a sessao de verdade
+        arquivo = tmp / "mine-bedrock-20260122T000000Z.tar.gz"
+        arquivo.write_bytes(b"x" * (dropbox.CHUNK * 2 + 17))
+        rotas = [u.rsplit("/", 2)[-2:] for u, _ in chamadas]
+        check("ainda nao chamou nada", chamadas == [])
+
+        dbx = dropbox.Dropbox(
+            token="tok", refresh_token="ref", app_key="key", app_secret="sec", http=Fake()
+        )
+        check("configurado com refresh token", dbx.configurado())
+        dbx.envia(arquivo, "/backups/teste.tar.gz")
+        def args_de(rota: str) -> list[dict]:
+            return [json.loads(a) for u, a in chamadas_arg if u.endswith(rota)]
+
+        iniciadas = args_de("/upload_session/start")
+        acrescentadas = args_de("/append_v2")
+        encerradas = args_de("/finish")
+        check("upload por sessao", len(iniciadas) == 1, rotas)
+        check("mandou os chunks do meio", len(acrescentadas) == 2, len(acrescentadas))
+        check("encerrou a sessao", len(encerradas) == 1, len(encerradas))
+        # o offset do append precisa crescer, senao o Dropbox devolve conflict
+        offsets = [a["cursor"]["offset"] for a in acrescentadas]
+        check("offset cresce entre os chunks", offsets == [dropbox.CHUNK, dropbox.CHUNK * 2], offsets)
+        # e o commit tem que fechar no tamanho real do arquivo, senao trunca
+        commit = encerradas[0]["commit"]
+        check("commit no path certo", commit["path"] == "/backups/teste.tar.gz", commit)
+        check("commit fecha no tamanho do arquivo", encerradas[0]["cursor"]["offset"] == arquivo.stat().st_size)
+        check("sessaoStarted com close=false", iniciadas[0].get("close") is False, iniciadas[0])
+
+        # refresh token: renovar uma vez e reaproveitar ate perto de expirar
+        fake = Fake()
+        # o relogio e injetado porque um teste de expiracao de 4 horas nao
+        # cabe num selftest: aqui a "agora" anda na mao.
+        relogio = [1000.0]
+        dbx2 = dropbox.Dropbox(
+            refresh_token="r", app_key="k", app_secret="s", http=fake, agora=lambda: relogio[0]
+        )
+        dbx2._token()
+        primeiro_validade = dbx2._validade
+        dbx2._token()
+        check("renova uma vez e reusa", fake.renovadas == 1, fake.renovadas)
+
+        # o token vale 14400s a partir da renovacao; a margem e 300s, entao
+        # abaixo de (validade - 300) ainda reusa e acima disso renova
+        limite = primeiro_validade - dropbox.RENOVAR_COM_MARGEM
+
+        relogio[0] = limite - 600
+        dbx2._token()
+        check("reusa enquanto o token vale", fake.renovadas == 1, fake.renovadas)
+
+        relogio[0] = limite + 1
+        dbx2._token()
+        check("renova assim que entra na margem", fake.renovadas == 2, fake.renovadas)
+
+        # token fixo: usado como esta, sem tentar renovar
+        dbx3 = dropbox.Dropbox(token="so-fixto", http=Fake())
+        check("token fixo serve", dbx3._token() == "so-fixto")
+        check("token fixo sozinho conta como configurado", dbx3.configurado())
+        check("sem nada nao esta configurado", not dropbox.Dropbox().configurado())
+
+        # link ja compartilhado: o Dropbox recusa e a gente busca o existente
+        class Recusa:
+            def __call__(self, url, *, body=None, headers=None, timeout=300.0) -> bytes:
+                if url.endswith("/create_shared_link_with_settings"):
+                    raise dropbox.DropboxError("shared link already exists", "shared_link_already_exists")
+                if url.endswith("/list_shared_links"):
+                    return b'{"links":[{"url":"https://dropbox.example/jah-existe"}]}'
+                raise AssertionError(url)
+
+        check("link repetido nao quebra", dropbox.Dropbox(token="t", http=Recusa()).link("/backups/a.tar.gz") == "https://dropbox.example/jah-existe")
+
+        # rotacao: apaga os antigos do bot e nao toca no que o usuario deixou
+        fake = Fake()
+        dbx4 = dropbox.Dropbox(token="t", http=fake)
+        apagados, _bytes, sobraram = dbx4.roda("/backups", backup.PREFIXO, manter=2)
+        deletados = [json.loads(c[1])["path"] for c in chamadas if c[0].endswith("/delete_v2")]
+        check("rotaciona pelo nome", apagados == ["mine-bedrock-20260101T000000Z.tar.gz"], apagados)
+        check("nao apaga o que nao e backup", all("arquivo-do-usuario" not in d for d in deletados), deletados)
+        check("mantem os novos", len(apagados) == 1, apagados)
+        check("conta quantos sobraram", sobraram == 2, sobraram)
+
+        # upload + rotacao + link, o caminho que o /backup faz de verdade
+        chamadas.clear()
+        chamadas_arg.clear()
+        fake = Fake()
+        arquivo = tmp / f"{backup.PREFIXO}20260122T000000Z.tar.gz"
+        arquivo.write_bytes(b"conteudo")
+        link, erro, apagados, sobraram = backup.sobe(
+            dropbox.Dropbox(token="t", http=Fake()), arquivo, manter=2
+        )
+        check("sobe e devolve o link", link == "https://dropbox.example/bkp" and not erro, (link, erro))
+        check(
+            "apagados no caminho completo",
+            apagados == ["mine-bedrock-20260101T000000Z.tar.gz"],
+            (apagados, sobraram),
+        )
+        # sem isto o Dropbox recusa os 4 MB antes de a gente ler o erro, e o
+        # usuario ve "Broken pipe" em vez de "falta a permissao X"
+        uploads = [h for h in fake.headers if "Dropbox-API-Arg" in h]
+        check("upload pede 100-continue", all(h.get("Expect") == "100-continue" for h in uploads), uploads[:1])
+
+        # Dropbox fora do ar: o erro vem, e nao uma excecao
+        class Cai:
+            def __call__(self, url, *, body=None, headers=None, timeout=300.0):
+                raise dropbox.DropboxError("nao consegui falar com o Dropbox: timeout")
+
+        link, erro, apagados, sobraram = backup.sobe(
+            dropbox.Dropbox(token="t", http=Cai()), arquivo, manter=2
+        )
+        check("dropbox fora devolve erro, nao levanta", link == "" and "timeout" in erro, (link, erro))
+
+        # --- a mensagem de erro do Dropbox ---
+        # Este e o caso que escondia a causa real: falta de permissao chega
+        # com error_summary "other/..." e a frase boa em user_message.text.
+        import urllib.error
+
+        def erro_http(corpo: bytes, code: int = 400) -> urllib.error.HTTPError:
+            return urllib.error.HTTPError("https://api.dropboxapi.com/x", code, "Bad Request", {}, io.BytesIO(corpo))
+
+        sem_permissao = json.dumps(
+            {
+                "error": {".tag": "other"},
+                "error_summary": "other/...",
+                "user_message": {
+                    "locale": "en",
+                    "text": "Your app (ID: 8703075) is not permitted to access this endpoint "
+                    "because it does not have the required scope 'files.content.write'.",
+                },
+            }
+        ).encode()
+        mensagem, codigo = dropbox._erro_http(erro_http(sem_permissao))
+        check("erro de permissao diz qual escopo falta", "files.content.write" in mensagem, mensagem)
+        check("erro de permissao nao mostra so o other", not mensagem.startswith("other"), mensagem)
+        check("erro de permissao guarda a sigla", "other" in mensagem, mensagem)
+        check("sigla do erro de permissao", codigo == "other", codigo)
+
+        # sem user_message o summary ainda tem que aparecer
+        simples = json.dumps({"error_summary": "path/not_found/...", "error": {".tag": "path"}}).encode()
+        mensagem, codigo = dropbox._erro_http(erro_http(simples))
+        check("summary usado quando nao ha user_message", "not_found" in mensagem, mensagem)
+        check("sigla do path/not_found", codigo == "path", codigo)
+
+        # corpo que nem e JSON nao pode estourar
+        mensagem, _ = dropbox._erro_http(erro_http(b"<html>500</html>", 500))
+        check("corpo nao-JSON nao quebra", bool(mensagem), mensagem)
+
+        # o Dropbox responde a mesma coisa de dois jeitos: JSON no upload e
+        # texto puro na API de metadados. Nos dois a frase boa e a mesma, e
+        # antes do conserto a de texto puro virava "Bad Request"
+        texto_puro = (
+            b'Error in call to API function "files/list_folder": Your app (ID: 8703075) is not '
+            b"permitted to access this endpoint because it does not have the required scope "
+            b"'files.metadata.read'."
+        )
+        mensagem, codigo = dropbox._erro_http(erro_http(texto_puro))
+        check("erro em texto puro diz o escopo", "files.metadata.read" in mensagem, mensagem)
+        check("erro em texto puro nao vira Bad Request", "Bad Request" not in mensagem, mensagem)
+        check("sigla do texto puro", codigo == "texto", codigo)
+
+        # corpo vazio: a mensagem ainda precisa apontar a causa provavel
+        mensagem, codigo = dropbox._erro_http(erro_http(b"", 400))
+        check("corpo vazio aponta permissao", "permissao" in mensagem, mensagem)
+        check("sigla do corpo vazio", codigo == "sem_detalhe", codigo)
+
+        # conexao cortada no meio do upload: precisa apontar a causa
+        # provavel. Sem isto o usuario so viu "Broken pipe" e nao deu pra
+        # descobrir que a app nao tinha permissao.
+        urlopen_real = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+            urllib.error.URLError(BrokenPipeError(32, "Broken pipe"))
+        )
+        try:
+            dropbox._http("https://content.dropboxapi.com/2/files/upload_session/append_v2", body=b"x" * 10, headers={})
+            check("pipe cortado levanta erro", False, "nao levantou")
+        except dropbox.DropboxError as exc:
+            texto = str(exc)
+            check("pipe cortado levanta erro", True)
+            check("mencao de permissao, nao so o errno", "permissao" in texto, texto)
+            check("some o Broken pipe cru", "Broken pipe" not in texto, texto)
+        finally:
+            urllib.request.urlopen = urlopen_real
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_backup() -> None:
+    print("\nbackup: empacotamento e rotacao")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        data = tmp / "data"
+        state = tmp / "state"
+        (data / "worlds" / "world").mkdir(parents=True)
+        (data / "behavior_packs" / "p1").mkdir(parents=True)
+        (data / "worlds" / "world" / "level.dat").write_bytes(b"mundo")
+        (data / "server.properties").write_text("level-name=world\n", encoding="utf-8")
+        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
+        (data / "bedrock_server-1.26.52.3").mkdir()
+        (data / "bedrock_server-1.26.52.3" / "binario").write_bytes(b"x" * 5000)
+        (data / "content_log.txt").write_text("log\n", encoding="utf-8")
+        (data / "server.properties.123.bak").write_text("velho\n", encoding="utf-8")
+        state.mkdir()
+        (state / "bot.db").write_bytes(b"sqlite")
+
+        alvos = backup._seleciona(data, state)
+        nomes = [dentro for _, dentro in alvos]
+        check("mundo entra", "data/worlds" in nomes, nomes)
+        check("config entra", "data/server.properties" in nomes, nomes)
+        check("allowlist entra", "data/allowlist.json" in nomes, nomes)
+        check("bot.db entra", "state/bot.db" in nomes, nomes)
+        check("binario do BDS nao entra", not any("bedrock_server" in n for n in nomes), nomes)
+        check("content log nao entra", "data/content_log.txt" not in nomes, nomes)
+        check("bak nao entra", not any(n.endswith(".bak") for n in nomes), nomes)
+
+        destino = tmp / "backup.tar.gz"
+        tamanho, _itens = backup.empacota(data, state, destino)
+        check("tar foi criado", destino.is_file() and tamanho > 0, tamanho)
+        check("o BDS de dentro do tar seria 5 KB", 5000 > tamanho, tamanho)
+
+        import tarfile
+
+        with tarfile.open(destino) as tar:
+            membros = tar.getnames()
+        check("mundo dentro do tar", "data/worlds/world/level.dat" in membros, membros)
+        check("bot.db dentro do tar", "state/bot.db" in membros, membros)
+        check("nada de binario no tar", not any("bedrock_server" in m for m in membros), membros)
+
+        # o tar tem que abrir de verdade: e o que o usuario faz na hora de restaurar
+        with tarfile.open(destino) as tar:
+            dado = tar.extractfile("data/worlds/world/level.dat").read()
+        check("conteudo do mundo legivel", dado == b"mundo", dado)
+
+        # rotacao local
+        pasta = tmp / "bk" / "atuais"
+        pasta.mkdir(parents=True)
+        for dia in ("01", "08", "15", "22", "29"):
+            (pasta / f"{backup.PREFIXO}2026{dia}T000000Z.tar.gz").write_bytes(b"x")
+        (pasta / "nao-e-backup.txt").write_bytes(b"x")
+        apagados = backup.roda_local(tmp / "bk", manter=3)
+        restantes = sorted(p.name for p in pasta.iterdir())
+        check("rotaciona local", len(apagados) == 2, apagados)
+        check("mantem os 3 novos", len(restantes) == 4, restantes)
+        check("nao apaga arquivo estranho", "nao-e-backup.txt" in restantes, restantes)
+
+        # nome ordenavel: dois backups no mesmo dia tem que ordenar por horario
+        nomes_ordenados = sorted(
+            [
+                backup.nome_arquivo(datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)),
+                backup.nome_arquivo(datetime(2026, 1, 2, 5, 4, tzinfo=timezone.utc)),
+            ]
+        )
+        check(
+            "nome ordena por tempo",
+            nomes_ordenados[0].endswith("20260102T030400Z.tar.gz"),
+            nomes_ordenados,
+        )
+        check("prefixo do bot", nomes_ordenados[0].startswith(backup.PREFIXO), nomes_ordenados)
+
+        # mundo travado: o LevelDB segura o .ldb logo apos o stop e o tar
+        # pegaria o arquivo pela metade, sem avisar
+        class Travado:
+            """um .ldb que so libera na segunda vez, como o SO faz."""
+
+            def __init__(self) -> None:
+                self.falhas = 0
+                self.aberturas = 0
+
+            def rglob(self, padrao):
+                return [self]
+
+            def is_file(self):
+                return True
+
+            def open(self, modo):
+                return self
+
+            def __enter__(self):
+                self.aberturas += 1
+                if self.falhas < 1:
+                    self.falhas += 1
+                    raise PermissionError(13, "Permission denied")
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        alvo = Travado()
+        backup._confere_mundo(alvo, espera=0)
+        check("repete quando o mundo trava", alvo.falhas == 1, alvo.falhas)
+        check("conferiu todos os arquivos do mundo", alvo.aberturas == 2, alvo.aberturas)
+
+        # e se nunca destrava, erro em vez de um tar pela metade
+        class SempreTravado(Travado):
+            name = "world"
+
+            def __enter__(self):
+                self.aberturas += 1
+                raise PermissionError(13, "Permission denied")
+
+        try:
+            backup._confere_mundo(SempreTravado(), tentativas=2, espera=0)
+            check("mundo travado da erro", False, "nao levantou")
+        except backup.BackupError:
+            check("mundo travado da erro", True)
+
+        # data/state vazios: erro claro em vez de um tar de 0 byte
+        vazio = Path(tempfile.mkdtemp())
+        try:
+            try:
+                backup.empacota(vazio, vazio, tmp / "vazio.tar.gz")
+                check("vazio da erro", False, "nao levantou")
+            except backup.BackupError:
+                check("vazio da erro", True)
+        finally:
+            shutil.rmtree(vazio, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ops_backup() -> None:
+    """O caminho de erro do /backup: o servidor volta e a vigia volta a olhar."""
+    print("backup: fluxo de erro do /backup")
+    import asyncio
+    from types import SimpleNamespace
+
+    class _Docker:
+        """DockerController que para e religa na hora, sem Docker nenhum."""
+
+        def __init__(self) -> None:
+            self.parou = False
+            self.subiu = False
+            self.diz = ""
+
+        def say(self, texto: str) -> None:
+            self.diz = texto
+
+        def para(self) -> None:
+            self.parou = True
+
+        def liga(self) -> None:
+            self.subiu = True
+
+        def state(self):
+            return SimpleNamespace(running=self.subiu)
+
+        def pronto(self):
+            return self.subiu, ""
+
+    async def espera_pronta_falsa(ctx):
+        """Sem ping e sem BOOT_TIMEOUT: o log ja vem pronto do _Docker."""
+        return ctx.docker.subiu, "", SimpleNamespace(jogadores=0)
+
+    async def cenario(empacota: str) -> tuple[bool, bool, bool, bool]:
+        """Roda o cria_backup com um empacota que leva o caminho indicado.
+
+        Devolve (deu backup, parou, religou, em_restart no fim). O ultimo e o
+        que importa: em_restart seguro impede a vigia de avisar queda de
+        verdade dali em diante, entao ele tem que voltar a False mesmo
+        quando o empacotamento estoura.
+        """
+        docker = _Docker()
+        pasta = Path(tempfile.mkdtemp())
+        cfg = SimpleNamespace(
+            announce_seconds=0,
+            backups_dir=pasta,
+            data_dir=Path("."),
+            state_dir=Path("."),
+            backup_local_keep=5,
+            backup_dropbox_keep=3,
+            dropbox=SimpleNamespace(token="", refresh_token="", app_key="", app_secret=""),
+        )
+        ctx = SimpleNamespace(config=cfg, docker=docker, em_restart=False)
+
+        def falha(*a, **k):
+            raise backup.BackupError("mundo travado")
+
+        def ecopota(*a, **k):
+            return 123, ["data/worlds"]
+
+        original = backup.empacota
+        backup.empacota = {"falha": falha, "ok": ecopota}[empacota]
+        try:
+            deu = False
+            try:
+                await ops.cria_backup(ctx, "teste")
+                deu = True
+            except backup.BackupError:
+                pass
+            return deu, docker.parou, docker.subiu, ctx.em_restart
+        finally:
+            backup.empacota = original
+            shutil.rmtree(pasta, ignore_errors=True)
+
+    original_espera = ops.espera_pronto
+    ops.espera_pronto = espera_pronta_falsa
+    try:
+        # o caminho feliz: para, empacota, religa e devolve o relatorio
+        deu, parou, subiu, vigia = asyncio.run(cenario("ok"))
+        check("backup feliz devolve relatorio", deu, deu)
+        check("parou antes de copiar", parou, parou)
+        check("religou antes de devolver", subiu, subiu)
+        check("vigia volta a olhar", not vigia, vigia)
+
+        # o caminho que importa: o empacotamento estoura
+        deu, parou, subiu, vigia = asyncio.run(cenario("falha"))
+        check("falha nao devolve backup", not deu, deu)
+        check("mesmo falhando, parou para copiar", parou, parou)
+        check("religou o servidor depois da falha", subiu, subiu)
+        check("falha tambem solta a vigia", not vigia, vigia)
+    finally:
+        ops.espera_pronto = original_espera
+
+
 if __name__ == "__main__":
     for teste in (
         test_detect_mcaddon,
@@ -924,6 +1394,9 @@ if __name__ == "__main__":
         test_interpreta_config,
         test_config_persiste,
         test_console,
+        test_dropbox,
+        test_backup,
+        test_ops_backup,
     ):
         teste()
     print()

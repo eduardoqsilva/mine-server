@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import addons, raknet, serverctl, txt
+from . import addons, backup, dropbox, raknet, serverctl, txt
 from .auth import Auth
 from .config import Config
 from .docker_ctl import DockerController
@@ -240,7 +240,10 @@ async def espera_pronto(ctx: AppContext) -> tuple[bool, str, raknet.PingResult]:
 
 
 def _relatorio(reason: str, cabecalho: str, corpo: list[str], icone: str = "♻️") -> str:
-    return "\n".join([txt.cabecalho(icone, cabecalho), "", txt.campo("Motivo", reason), "", *corpo])
+    cabecalhos = [txt.cabecalho(icone, cabecalho)]
+    if reason:
+        cabecalhos += ["", txt.campo("Motivo", reason)]
+    return "\n".join([*cabecalhos, "", *corpo])
 
 
 def _falhou(reason: str, erro: str, dica: str = "") -> str:
@@ -254,22 +257,41 @@ async def restart_server(ctx: AppContext, reason: str) -> str:
     """Reinicia o container, reaplica a versao estavel e confirma se voltou.
 
     NUNCA levanta excecao: quem chama esta funcao ja mandou "reiniciando..." no
-    Telegram, e uma excecao subindo daqui deixava o admin olhando para o
+    Telegram, e uma excecao subindo daqui deixaria o admin olhando para o
     silencio, sem nenhuma confirmacao. Qualquer problema vira um relatorio
     com o veredito na propria mensagem.
     """
-    try:
-        ctx.em_restart = True
-        return await _reinicia(ctx, reason)
-    except Exception as exc:
-        log.exception("restart_server levantou")
-        return _falhou(
-            reason,
-            f"Falha inesperada durante o restart: {exc}",
-            "Veja: docker compose logs bds",
-        )
-    finally:
-        ctx.em_restart = False
+    async with _restart_lock(ctx):
+        try:
+            ctx.em_restart = True
+            return await _reinicia(ctx, reason)
+        except Exception as exc:
+            log.exception("restart_server levantou")
+            return _falhou(
+                reason,
+                f"Falha inesperada durante o restart: {exc}",
+                "Veja: docker compose logs bds",
+            )
+        finally:
+            ctx.em_restart = False
+
+
+_locks: dict[int, asyncio.Lock] = {}
+
+
+def _restart_lock(ctx: AppContext) -> asyncio.Lock:
+    """Serializa os motivos de reinicio.
+
+    O agendador das 05:00, o backup semanal e um /reiniciar do admin podem
+    cair no mesmo minuto. Sem esta trava, dois reinicios se atropelam: o
+    segundo stop chega enquanto o primeiro ainda espera o boot, e o relatorio
+    do primeiro volta dizendo que o servidor nao subiu, o que e mentira - ele
+    so nao subiu ainda. A chave e o id do ctx, que dura o processo todo.
+    """
+    trava = _locks.get(id(ctx))
+    if trava is None:
+        trava = _locks[id(ctx)] = asyncio.Lock()
+    return trava
 
 
 async def _reinicia(ctx: AppContext, reason: str) -> str:
@@ -336,6 +358,164 @@ async def _reinicia(ctx: AppContext, reason: str) -> str:
             ),
         ]
     return _relatorio(reason, "reiniciado", corpo)
+
+
+async def cria_backup(ctx: AppContext, motivo: str) -> tuple[backup.Backup, str]:
+    """Faz o backup do estado atual e devolve (backup, relatorio).
+
+    A ordem e parada -> copia -> liga, e nao pode ser outra: o BDS escreve no
+    mundo o tempo todo, e um tar tirado com o servidor no ar pega arquivos no
+    meio de uma gravacao. Um backup que falha ao ser extraido e pior do que
+    nenhum, porque voce so descobre na hora de restaurar.
+
+    O container volta a subir num finally, mesmo se o empacotamento explodir:
+    ficar com o servidor fora do ar por causa de um .tar.gz seria o pior
+    resultado possivel desta funcao. O em_restart tambem volta no finally, e
+    nao so no caminho feliz: se ele ficasse ligado depois de uma falha, a
+    vigia silenciava toda queda de verdade dali em diante.
+    """
+    cfg = ctx.config
+    async with _restart_lock(ctx):
+        # em_restart fica ligado ate o container voltar: e o que segura a
+        # vigia, que veria o container parar sem ser o /reiniciar e mandaria
+        # um "o servidor caiu" no meio de um backup que esta indo bem.
+        ctx.em_restart = True
+        inicio = time.monotonic()
+        arquivo = cfg.backups_dir / "atuais" / backup.nome_arquivo()
+        try:
+            try:
+                if cfg.announce_seconds > 0:
+                    await asyncio.to_thread(ctx.docker.say, f"[bot] {motivo} - salvando o mundo em {cfg.announce_seconds}s")
+                    await asyncio.sleep(cfg.announce_seconds)
+
+                await asyncio.to_thread(ctx.docker.para)
+                # o mundo so esta integro depois que o BDS larga o arquivo: o
+                # entry script so manda o "stop", e o processo precisa de alguns
+                # segundos para fechar o mundo e sair.
+                await asyncio.sleep(2.0)
+
+                tamanho, itens = await asyncio.to_thread(
+                    backup.empacota, cfg.data_dir, cfg.state_dir, arquivo
+                )
+            except Exception as exc:
+                log.exception("backup falhou antes de terminar o empacotamento")
+                # se este religa falhar, sobe o erro dele: servidor parado e o
+                # problema maior que o empacotamento, e o log.exception acima
+                # ja deixou o original registrado
+                await _religa(ctx)
+                raise backup.BackupError(f"nao consegui empacotar: {exc}") from exc
+
+            # subir para o Dropbox e demorado (o .tar.gz passa de 100 MB) e nao
+            # precisa do servidor parado: o mundo ja esta no disco. Por isso o
+            # container volta antes, e o upload roda com o jogo no ar.
+            await _religa(ctx)
+        finally:
+            # so depois de confirmado que o servidor voltou: enquanto ele esta
+            # subindo, a queda e esperada e nao e para avisar o usuario
+            ctx.em_restart = False
+
+        segundos = time.monotonic() - inicio
+
+        apagados_local = await asyncio.to_thread(
+            backup.roda_local, cfg.backups_dir, cfg.backup_local_keep
+        )
+        registro = backup.Backup(
+            caminho=arquivo,
+            nome=arquivo.name,
+            tamanho=tamanho,
+            itens=itens,
+            segundos=segundos,
+            apagados_local=apagados_local,
+        )
+
+        dbx = dropbox.Dropbox(
+            token=cfg.dropbox.token,
+            refresh_token=cfg.dropbox.refresh_token,
+            app_key=cfg.dropbox.app_key,
+            app_secret=cfg.dropbox.app_secret,
+        )
+        if not dbx.configurado():
+            registro.erro_dropbox = "sem credencial do Dropbox no .env"
+            return registro, _relatorio_backup(registro, motivo)
+
+        link, erro, apagados, sobraram = await asyncio.to_thread(
+            backup.sobe, dbx, arquivo, cfg.backup_dropbox_keep
+        )
+        registro.link = link
+        registro.erro_dropbox = erro
+        registro.apagados_dropbox = apagados
+        registro.dropbox_total = sobraram
+        return registro, _relatorio_backup(registro, motivo)
+
+
+async def _religa(ctx: AppContext) -> None:
+    """Sobe o container e espera ficar pronto, sem levantar excecao.
+
+    Chamar duas vezes (uma no except e outra depois do empacotamento) e
+    proposital: o except ja devolveu o erro, entao a segunda volta faz o
+    container subir do estado parado em que o primeiro deixou.
+    """
+    if not (await asyncio.to_thread(ctx.docker.state)).running:
+        try:
+            await asyncio.to_thread(ctx.docker.liga)
+        except Exception as exc:
+            log.exception("nao consegui religar o container")
+            raise backup.BackupError(f"parei o servidor para o backup e nao consegui religar: {exc}") from exc
+        pronto, alerta, _ = await espera_pronto(ctx)
+        if not pronto:
+            log.error("servidor nao voltou depois do backup: %s", alerta or "sem 'Server started.'")
+            raise backup.BackupError("o servidor nao voltou depois do backup")
+
+
+def _relatorio_backup(registro: backup.Backup, motivo: str) -> str:
+    mb = registro.tamanho / 1048576
+    corpo = [
+        f"{txt.OK} Mundo e config salvos no estado de agora.",
+        "",
+        txt.campo("Arquivo", registro.nome),
+        txt.campo("Tamanho", f"{mb:.1f} MB"),
+        txt.campo("Servidor fora do ar", f"{registro.segundos:.0f}s"),
+    ]
+    if registro.link:
+        corpo += ["", txt.campo("Link", registro.link)]
+    if registro.erro_dropbox:
+        corpo += [
+            "",
+            txt.aviso("Ficou so na VPS, o Dropbox nao aceitou: " + registro.erro_dropbox),
+            txt.sub([f"Copie por SSH: {registro.caminho}"]),
+        ]
+    if registro.apagados_dropbox:
+        rotacao = (
+            f"No Dropbox apaguei {len(registro.apagados_dropbox)} antigo(s), "
+            f"ficaram {registro.dropbox_total}."
+        )
+        corpo += ["", txt.sub([rotacao])]
+    if registro.apagados_local:
+        corpo += ["", txt.sub([f"Na VPS apaguei {len(registro.apagados_local)} antigo(s)."])]
+    return _relatorio(motivo, "backup pronto", corpo, icone="💾")
+
+
+def status_backup(ctx: AppContext) -> str:
+    """O que existe agora, sem fazer nada."""
+    cfg = ctx.config
+    pasta = cfg.backups_dir / "atuais"
+    meus = sorted((p for p in pasta.iterdir() if p.is_file()), key=lambda p: p.name) if pasta.is_dir() else []
+    corpo = [
+        txt.campo("Na VPS", f"{len(meus)} de {cfg.backup_local_keep}"),
+        txt.campo("Pasta", str(pasta)),
+        txt.campo("Dropbox", cfg.dropbox.resumo()),
+        txt.campo("Automatico", f"{DIAS_SEMANA[cfg.backup_day % 7]} {cfg.backup_hour:02d}:{cfg.backup_minute:02d} ({cfg.tz})"),
+    ]
+    if meus:
+        ultimo = meus[-1]
+        corpo += [
+            "",
+            txt.campo("Ultimo", f"{ultimo.name} ({ultimo.stat().st_size / 1048576:.1f} MB)"),
+        ]
+    return _relatorio("", "backup", corpo, icone="💾")
+
+
+DIAS_SEMANA = ("segunda", "terca", "quarta", "quinta", "sexta", "sabado", "domingo")
 
 
 def lista_packs(ctx: AppContext) -> str:

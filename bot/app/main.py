@@ -88,6 +88,44 @@ async def agendador(ctx: AppContext, bot: Bot) -> None:
             await notificar(bot, ctx, txt.erro(f"Auto-update falhou: {exc}"))
 
 
+async def agendador_backup(ctx: AppContext, bot: Bot) -> None:
+    """Backup semanal, uma vez por semana no dia e hora configurados.
+
+    Mesmo desenho do agendador das 05:00: calcula o proximo dia da semana,
+    dorme e repete. Repete em vez de contar 7 dias porque assim um boot do
+    bot nao empurra o backup, e o horario continua sendo o que o admin pediu.
+
+    O erro nao derruba a task: um Dropbox fora do ar as 04:00 nao pode
+    deixar o servidor sem backup nas semanas seguintes.
+    """
+    cfg = ctx.config
+    while True:
+        agora = datetime.now(cfg.tz)
+        # timedelta(days=...) resolve a virada de semana e de ano sozinha.
+        dias = (cfg.backup_day - agora.weekday()) % 7
+        alvo = (agora + timedelta(days=dias)).replace(
+            hour=cfg.backup_hour, minute=cfg.backup_minute, second=0, microsecond=0
+        )
+        if alvo <= agora:
+            alvo += timedelta(days=7)
+        horas = (alvo - agora).total_seconds() / 3600
+        log.info("backup: proximo em %s (%.1fh)", alvo.isoformat(timespec="minutes"), horas)
+        await asyncio.sleep((alvo - agora).total_seconds())
+
+        if not (await asyncio.to_thread(ctx.docker.state)).running:
+            log.warning("backup pulado: o servidor esta fora do ar")
+            await notificar(
+                bot, ctx, txt.aviso("Backup semanal pulado: o servidor ja estava parado.")
+            )
+            continue
+        try:
+            _, relatorio = await ops.cria_backup(ctx, "backup semanal automatico")
+            await notificar(bot, ctx, relatorio)
+        except Exception as exc:
+            log.exception("backup semanal falhou")
+            await notificar(bot, ctx, txt.erro(f"Backup semanal falhou: {exc}"))
+
+
 async def vigia(ctx: AppContext, bot: Bot) -> None:
     """Avisa quando o BDS muda de estado sem ser o bot a mandar.
 
@@ -209,6 +247,7 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(agendador(ctx, bot)),
+        asyncio.create_task(agendador_backup(ctx, bot)),
         asyncio.create_task(reconciliador(ctx, bot)),
         asyncio.create_task(vigia(ctx, bot)),
         asyncio.create_task(faxina(ctx)),
@@ -224,6 +263,12 @@ async def main() -> None:
                         "",
                         txt.campo("Container", cfg.bds_container),
                         txt.campo("Auto-update", f"{cfg.update_hour:02d}:{cfg.update_minute:02d} ({cfg.tz})"),
+                        txt.campo(
+                            "Backup semanal",
+                            f"{ops.DIAS_SEMANA[cfg.backup_day % 7]} "
+                            f"{cfg.backup_hour:02d}:{cfg.backup_minute:02d} ({cfg.tz})",
+                        ),
+                        txt.campo("Dropbox", cfg.dropbox.resumo()),
                         "",
                         txt.info("Use /admin para os comandos."),
                     ]

@@ -57,6 +57,7 @@ HELP = "\n".join(
 
 BOT_COMMANDS = [
     {"command": "status", "description": "como esta o servidor"},
+    {"command": "backup", "description": "salvar o mundo de agora e receber o link"},
     {"command": "packs", "description": "add-ons instalados"},
     {"command": "entrar", "description": "usar uma chave de leitura"},
     {"command": "ajuda", "description": "como usar"},
