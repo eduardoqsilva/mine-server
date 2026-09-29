@@ -14,6 +14,7 @@ so limpa os dados do runtime do servidor e do bot.
 
 from __future__ import annotations
 
+import argparse
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,15 @@ def run(cmd: list[str]) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Reset completo do ambiente Mine Bedrock.")
+    parser.add_argument(
+        "--yes",
+        "--force",
+        action="store_true",
+        help="Executa sem pedir confirmacao interativa. Use com cuidado.",
+    )
+    args = parser.parse_args()
+
     repo_root = Path(__file__).resolve().parent
     try:
         ensure_repo_root(repo_root)
@@ -73,7 +83,13 @@ def main() -> int:
     print("Nao apaga os arquivos do projeto, como compose.yml, .env, codigo-fonte e scripts.")
     print("=" * 72)
 
-    if not confirm("Digite RESET_ALL para confirmar e zera tudo: "):
+    if args.yes:
+        confirmou = True
+        print("Modo --yes ativado: confirmacao automatica.")
+    else:
+        confirmou = confirm("Digite RESET_ALL para confirmar e zera tudo: ")
+
+    if not confirmou:
         print("Operacao cancelada. Nenhum dado foi apagado.")
         return 0
 
