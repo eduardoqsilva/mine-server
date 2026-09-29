@@ -24,8 +24,10 @@ services:
       GID: "${PGID:-1000}"
       TZ: "${TZ:-America/Sao_Paulo}"
       # Aviso importante: daqui para baixo estao SO as variaveis de primeira
-      # instalacao. Nao coloque aqui gamemode, difficulty, max-players,
-      # view-distance, server-name ou default-player-permission-level.
+      # instalacao, exceto allow-list e permissao padrao, que sao invariantes
+      # do projeto: o servidor aceita qualquer jogador como visitor.
+      # Nao coloque aqui gamemode, difficulty, max-players,
+      # view-distance ou server-name.
       #
       # O image NAO reescreve o /data/server.properties inteiro: o
       # bedrock-entry.sh so passa para o arquivo as propriedades que tem
@@ -39,26 +41,26 @@ services:
       #
       # Nos dois o bot avisa no /config da chave e nao guarda override: um
       # override aqui seria reescrito no boot seguinte de qualquer jeito.
-      # OFF de proposito, e e o padrao do projeto. E' o que deixa o servidor
-      # aberto pra quem joga sem conta Microsoft: sem autenticacao o cliente
-      # nao tem XUID, e o permissions.json (o /ops) casa so por XUID - com o
-      # online-mode desligado ele nao tem como funcionar.
-      # Se precisar de op, ligue com ONLINE_MODE=true no .env e reinicie.
+      # ONLINE_MODE fica true por padrao para autenticar XUIDs usados pelo /ops.
+      # Isso nao ativa convite nem allow-list: ALLOW_LIST permanece false.
+      # Para conexoes publicas, o cliente Bedrock tambem exige conta Xbox.
       #
       # Quem manda nesta e' o .env, nao o /config do bot: a imagem reescreve
       # server.properties em todo boot (o ONLINE_MODE esta no
       # bds-property-definitions.json da imagem), entao valor gravado aqui
       # seria desfeito no restart seguinte.
       ONLINE_MODE: "${ONLINE_MODE:-true}"
-      # Nao defina ALLOW_LIST, ALLOW_LIST_USERS, OPS, MEMBERS nem VISITORS aqui.
+      # Forcados em todo boot: ninguem precisa ser convidado para entrar, e
+      # todo jogador sem permissao explicita entra como visitor.
+      ALLOW_LIST: "false"
+      DEFAULT_PLAYER_PERMISSION_LEVEL: "visitor"
+      # Nao defina ALLOW_LIST_USERS, OPS, MEMBERS nem VISITORS aqui.
       # A imagem sabe escrever o allowlist.json e o permissions.json inteiros a
       # cada boot a partir dessas variaveis, e sobrescreveriam o trabalho do
       # bot: o /ops passaria a ser um comando que o entrypoint desfaz.
       #
-      # O servidor e' aberto (allow-list=false) e nao existe lista no bot. Se
-      # algum dia voce quiser trancar a porta, defina ALLOW_LIST=true aqui e
-      # reinicie o container - mas ai quem escreve o allowlist.json volta a ser
-      # a imagem, e nao o bot.
+      # O allowlist.json pode conter nomes antigos, mas e' ignorado enquanto
+      # ALLOW_LIST=false. Nao ligue essa variavel: o fluxo do projeto e' aberto.
       LEVEL_NAME: "${LEVEL_NAME:-world}"
       # Atras de NAT (que e o caso de quase toda VPS publica) o nethernet
       # anuncia o IP privado da interface, que ninguem de fora alcanca, e o
