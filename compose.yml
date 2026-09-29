@@ -92,7 +92,6 @@ services:
       # fila. O "stop" imediato ainda salva o mundo, e o stop_grace_period
       # abaixo cobre o caso do SIGKILL.
       STOP_SERVER_ANNOUNCE_DELAY: "0"
-      OPS: "${OPS:-}"
     network_mode: host
     # SEM bloco `ports:` de proposito. O nethernet (BDS 1.26.51+) nao e so
     # "abrir a porta": o servidor sorteia os candidatos ICE a partir das

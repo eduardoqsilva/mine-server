@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS audit (
     detail  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
+CREATE TABLE IF NOT EXISTS bedrock_players (
+    xuid       TEXT PRIMARY KEY,
+    gamertag   TEXT NOT NULL,
+    permission TEXT NOT NULL DEFAULT 'visitor'
+               CHECK(permission IN ('visitor', 'member', 'operator')),
+    decision   TEXT NOT NULL DEFAULT 'pending'
+               CHECK(decision IN ('pending', 'declined', 'approved')),
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL
+);
 
 -- A allow-list foi removida: o servidor fica aberto (allow-list=false) e quem
 -- cuida de permissao agora e' o /ops (permissions.json, por XUID). As duas
@@ -336,3 +346,59 @@ class Store:
                 "SELECT * FROM audit ORDER BY at DESC LIMIT ?", (limite,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------------------------------------------------------- jogadores BDS
+
+    def registra_jogador(self, gamertag: str, xuid: str) -> tuple[dict, bool]:
+        """Salva o primeiro spawn como visitor e diz se ainda falta perguntar."""
+        agora = time.time()
+        with self._lock:
+            atual = self._db.execute(
+                "SELECT * FROM bedrock_players WHERE xuid = ?", (str(xuid),)
+            ).fetchone()
+            if atual is None:
+                self._db.execute(
+                    "INSERT INTO bedrock_players "
+                    "(xuid, gamertag, permission, decision, first_seen, last_seen) "
+                    "VALUES (?, ?, 'visitor', 'pending', ?, ?)",
+                    (str(xuid), gamertag, agora, agora),
+                )
+                perguntar = True
+            else:
+                perguntar = atual["decision"] == "pending"
+                self._db.execute(
+                    "UPDATE bedrock_players SET gamertag = ?, last_seen = ? WHERE xuid = ?",
+                    (gamertag, agora, str(xuid)),
+                )
+            self._db.commit()
+            row = self._db.execute(
+                "SELECT * FROM bedrock_players WHERE xuid = ?", (str(xuid),)
+            ).fetchone()
+        return dict(row), perguntar
+
+    def define_jogador(
+        self, gamertag: str, xuid: str, permission: str, decision: str
+    ) -> None:
+        if permission not in ("visitor", "member", "operator"):
+            raise ValueError("permissao invalida")
+        if decision not in ("pending", "declined", "approved"):
+            raise ValueError("decisao invalida")
+        agora = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO bedrock_players "
+                "(xuid, gamertag, permission, decision, first_seen, last_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(xuid) DO UPDATE SET "
+                "gamertag = excluded.gamertag, permission = excluded.permission, "
+                "decision = excluded.decision, last_seen = excluded.last_seen",
+                (str(xuid), gamertag, permission, decision, agora, agora),
+            )
+            self._db.commit()
+
+    def jogador(self, xuid: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM bedrock_players WHERE xuid = ?", (str(xuid),)
+            ).fetchone()
+        return dict(row) if row else None

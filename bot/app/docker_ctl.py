@@ -29,7 +29,7 @@ class ContainerState:
     image: str
 
 
-def _delta(antes: list[str], agora: list[str]) -> list[str]:
+def novas_linhas(antes: list[str], agora: list[str]) -> list[str]:
     """Linhas que apareceram entre as duas leituras do log.
 
     Nao da para contar: `docker logs --tail=N` devolve sempre N linhas assim
@@ -47,6 +47,9 @@ def _delta(antes: list[str], agora: list[str]) -> list[str]:
         if antes[-k:] == agora[:k]:
             return agora[k:]
     return []
+
+
+_delta = novas_linhas
 
 
 def _motivo_recusa(saida: str) -> str:
@@ -152,9 +155,9 @@ class DockerController:
         fim = ultima + espera
         while time.monotonic() < fim:
             time.sleep(0.35)
-            novas = _delta(antes, self.logs(lines=500).splitlines())
-            if len(novas) > len(linhas):
-                linhas = novas
+            linhas_novas = novas_linhas(antes, self.logs(lines=500).splitlines())
+            if len(linhas_novas) > len(linhas):
+                linhas = linhas_novas
                 ultima = time.monotonic()
             elif time.monotonic() - ultima >= 0.8 and linhas:
                 break

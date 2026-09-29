@@ -31,6 +31,11 @@ log = logging.getLogger("bds.server")
 
 XUID_RE = re.compile(r"\b\d{15,20}\b")
 PLAYER_CONNECTED_RE = re.compile(r"Player connected:\s*(?P<nome>.+?)/(?P<xuid>\d{15,20})\s*$", re.IGNORECASE)
+PLAYER_SPAWNED_RE = re.compile(
+    r"Player Spawned:\s*(?P<nome>.+?)\s+xuid:\s*(?P<xuid>\d{15,20})"
+    r"(?:,\s*pfid:\s*[0-9a-f]+)?\s*$",
+    re.IGNORECASE,
+)
 
 BACKUP_SUFFIX = ".bak"
 
@@ -393,12 +398,10 @@ class ServerControl:
 
 
 def parse_player_connected(linha: str) -> tuple[str, str] | None:
-    """Extrai (nome, xuid) de uma linha do log do servidor do tipo
-    `Player connected: Ze Do Zero/2535453759792258`.
-    """
+    """Extrai (gamertag, xuid) de eventos connected ou spawned do BDS."""
     if not linha:
         return None
-    match = PLAYER_CONNECTED_RE.search(linha)
+    match = PLAYER_CONNECTED_RE.search(linha) or PLAYER_SPAWNED_RE.search(linha)
     if not match:
         return None
     nome = match.group("nome").strip()

@@ -536,6 +536,27 @@ def test_store() -> None:
         st.audita(2, "config", "difficulty=hard")
         reg = st.auditoria(5)
         check("auditoria gravada", bool(reg) and reg[0]["action"] == "config", reg)
+
+        jogador, perguntar = st.registra_jogador("Eduhqs", "2535463291192118")
+        check(
+            "spawn novo salvo como visitor pendente",
+            perguntar and jogador["permission"] == "visitor" and jogador["decision"] == "pending",
+            jogador,
+        )
+        st.define_jogador("Eduhqs", "2535463291192118", "visitor", "declined")
+        jogador, perguntar = st.registra_jogador("Eduhqs", "2535463291192118")
+        check(
+            "recusa persistida nao pergunta de novo",
+            not perguntar and jogador["permission"] == "visitor" and jogador["decision"] == "declined",
+            jogador,
+        )
+        st.define_jogador("Eduhqs", "2535463291192118", "member", "approved")
+        jogador, perguntar = st.registra_jogador("Eduhqs", "2535463291192118")
+        check(
+            "member persistido nao recebe nova pergunta",
+            not perguntar and jogador["permission"] == "member" and jogador["decision"] == "approved",
+            jogador,
+        )
         st.fecha()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -790,6 +811,12 @@ def test_serverctl() -> None:
             serverctl.parse_player_connected("[Server] Player connected: Ze Do Zero/2535453759792258")
             == ("Ze Do Zero", "2535453759792258"),
         )
+        check(
+            "evento Player Spawned com xuid e pfid parseado",
+            serverctl.parse_player_connected(
+                "[2026-09-29 12:00:00:000 INFO] Player Spawned: Eduhqs xuid: 2535463291192118, pfid: 47998C57B6BFE2B0"
+            ) == ("Eduhqs", "2535463291192118"),
+        )
         check("evento sem xuid volta None", serverctl.parse_player_connected("[Server] Player connected: Ze") is None)
 
         # online-mode decide se o /ops pode funcionar: o permissions.json casa
@@ -800,6 +827,68 @@ def test_serverctl() -> None:
         check("sem a chave, vale o padrao do BDS (true)", srv.online_mode() is True, srv.le_props())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_promocao_confirma_reload() -> None:
+    print("admin: promocao so confirma se permission reload foi aceito")
+
+    class FakeServer:
+        def online_mode(self) -> bool:
+            return True
+
+        def set_permissao(self, nome: str, xuid: str, nivel: str) -> bool:
+            return True
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.jogador: tuple[str, str, str, str] | None = None
+
+        def define_jogador(self, nome: str, xuid: str, nivel: str, decisao: str) -> None:
+            self.jogador = (nome, xuid, nivel, decisao)
+
+        def audita(self, *args: object) -> None:
+            pass
+
+    class FakeDocker:
+        def __init__(self, erro: str, linhas: list[str]) -> None:
+            self.erro = erro
+            self.linhas = linhas
+
+        def console(self, comando: str) -> tuple[str, list[str]]:
+            return self.erro, self.linhas
+
+    store_fake = FakeStore()
+    contexto = SimpleNamespace(
+        server=FakeServer(),
+        store=store_fake,
+        docker=FakeDocker("send-command recusou: processo do BDS nao encontrado", []),
+    )
+    sucesso, resposta = asyncio.run(
+        admin._promover_jogador(
+            contexto, "Eduhqs", "2535463291192118", "member", quem=1, origem="/member"
+        )
+    )
+    check("reload recusado nao finge sucesso", not sucesso and "recusou permission reload" in resposta, resposta)
+    check("permissao pretendida fica salva no sqlite", store_fake.jogador == (
+        "Eduhqs", "2535463291192118", "member", "approved"
+    ), store_fake.jogador)
+
+    contexto.docker.erro = ""
+    contexto.docker.linhas = ["Reloaded permissions from file."]
+    sucesso, resposta = asyncio.run(
+        admin._promover_jogador(
+            contexto, "Eduhqs", "2535463291192118", "member", quem=1, origem="/member"
+        )
+    )
+    check("resposta do BDS confirma promocao", sucesso and "Reloaded permissions" in resposta, resposta)
+
+    contexto.docker.linhas = ["permission reload"]
+    sucesso, resposta = asyncio.run(
+        admin._promover_jogador(
+            contexto, "Eduhqs", "2535463291192118", "member", quem=1, origem="/member"
+        )
+    )
+    check("reload sem resposta nao finge sucesso", not sucesso and "nao recebi confirmacao" in resposta, resposta)
 
 
 def test_interpreta_config() -> None:
@@ -1619,6 +1708,7 @@ def test_firewall() -> None:
     compose = (raiz / "compose.yml").read_text(encoding="utf-8")
     exemplo = (raiz / ".env.example").read_text(encoding="utf-8")
     check("compose.yml sem SERVER_IP", "SERVER_IP" not in compose)
+    check("compose nao define OPS que sobrescreve permissions.json", not re.search(r"^\s+OPS:", compose, re.M))
     check(".env.example nao define SERVER_IP", not re.search(r"^SERVER_IP=", exemplo, re.M))
     check("README nao ensina /config server-ip=", "/config server-ip=" not in readme)
 
@@ -1634,6 +1724,7 @@ if __name__ == "__main__":
         test_store_migracao_allowlist,
         test_auth,
         test_serverctl,
+        test_promocao_confirma_reload,
         test_interpreta_config,
         test_nome_do_gamertag,
         test_config_persiste,

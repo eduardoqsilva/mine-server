@@ -23,7 +23,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import UpdateType
 from aiogram.types import BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
 
-from . import admin, handlers, ops, serverctl, txt
+from . import admin, docker_ctl, handlers, ops, serverctl, txt
 from .auth import AuthMiddleware
 from .config import Config, ConfigError
 from .ops import AppContext, notificar
@@ -206,7 +206,8 @@ async def vigia_jogadores(ctx: AppContext, bot: Bot) -> None:
     except Exception as exc:
         log.warning("vigia_jogadores: falha na leitura inicial do log: %s", exc)
         return
-    visto: set[tuple[str, str]] = {(nome.casefold(), xuid) for nome, xuid in serverctl.jogadores_conectados(logs)}
+    linhas_anteriores = logs.splitlines()
+    inicializado = bool(linhas_anteriores)
 
     while True:
         await asyncio.sleep(10)
@@ -215,13 +216,33 @@ async def vigia_jogadores(ctx: AppContext, bot: Bot) -> None:
         except Exception as exc:
             log.warning("vigia_jogadores: falha ao ler o log: %s", exc)
             continue
-        for nome, xuid in serverctl.jogadores_conectados(logs):
-            chave = (nome.casefold(), xuid)
-            if chave in visto:
+        linhas_atuais = logs.splitlines()
+        if not linhas_atuais:
+            continue
+        if not inicializado:
+            linhas_anteriores = linhas_atuais
+            inicializado = True
+            continue
+
+        novas = docker_ctl.novas_linhas(linhas_anteriores, linhas_atuais)
+        linhas_anteriores = linhas_atuais
+        eventos: dict[str, str] = {}
+        for linha in novas:
+            evento = serverctl.parse_player_connected(linha)
+            if evento is not None:
+                nome, xuid = evento
+                eventos[xuid] = nome
+
+        for xuid, nome in eventos.items():
+            jogador, perguntar = ctx.store.registra_jogador(nome, xuid)
+            if not perguntar:
+                log.info(
+                    "jogador %s (%s) registrado como %s; decisao=%s",
+                    jogador["gamertag"], xuid, jogador["permission"], jogador["decision"],
+                )
                 continue
-            visto.add(chave)
             mensagem = (
-                txt.cabecalho("👤", "novo jogador entrou")
+                txt.cabecalho("👤", "jogador entrou")
                 + "\n\n"
                 + txt.campo("Jogador", nome)
                 + "\n"

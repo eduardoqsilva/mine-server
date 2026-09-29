@@ -296,25 +296,59 @@ async def _resolva_xuid(ctx: AppContext, nome: str, xuid: str | None) -> str | N
     return ctx.server.xuid_no_log(nome, log_txt)
 
 
-async def _promover_jogador(ctx: AppContext, nome: str, xuid: str | None, nivel: str, *, quem: int, origem: str) -> str:
+async def _promover_jogador(
+    ctx: AppContext, nome: str, xuid: str | None, nivel: str, *, quem: int, origem: str
+) -> tuple[bool, str]:
     if not ctx.server.online_mode():
-        return (
+        return False, (
             "O online-mode esta desligado, entao o permissions.json nao consegue casar o jogador "
             f"por XUID. Ative ONLINE_MODE=true no .env e reinicie o servidor para aceitar {nome} como {nivel}."
         )
     xuid_real = await _resolva_xuid(ctx, nome, xuid)
     if xuid_real is None:
-        return (
+        return False, (
             f"Nao achei o XUID de {nome} no log do servidor. "
             f"Espere o player entrar e tente de novo, ou mande {origem} com o XUID manualmente."
         )
     try:
         mudou = await asyncio.to_thread(ctx.server.set_permissao, nome, xuid_real, nivel)
-    except serverctl.PropertyError as exc:
-        return str(exc)
+    except (OSError, serverctl.PropertyError) as exc:
+        return False, f"Nao consegui gravar permissions.json: {exc}"
+    decisao = "declined" if nivel == "visitor" else "approved"
+    ctx.store.define_jogador(nome, xuid_real, nivel, decisao)
     ctx.store.audita(quem, "ops", f"{nome}={nivel} xuid={xuid_real}")
-    await asyncio.to_thread(ctx.docker.exec, "send-command", "permission", "reload")
-    return f"{nome} = {nivel} (xuid {xuid_real})\n" + ("Recarregado sem reiniciar." if mudou else "Ja estava assim.")
+    try:
+        erro, linhas = await asyncio.to_thread(ctx.docker.console, "permission reload")
+    except Exception as exc:
+        return False, (
+            f"Gravei {nome} = {nivel} no permissions.json e no SQLite, mas nao consegui "
+            f"recarregar no servidor: {exc}"
+        )
+    if erro:
+        return False, (
+            f"Gravei {nome} = {nivel} no permissions.json e no SQLite, mas o servidor "
+            f"recusou permission reload: {erro}"
+        )
+    resposta_reload = " ".join(ops.limpa_resposta("permission reload", linhas)).strip()
+    if not resposta_reload:
+        return False, (
+            f"Gravei {nome} = {nivel} no permissions.json e no SQLite, mas nao recebi "
+            "confirmacao do servidor para permission reload. Verifique /console permission reload."
+        )
+    if any(
+        trecho in resposta_reload.casefold()
+        for trecho in ("unknown command", "syntax error", "permission denied", "failed")
+    ):
+        return False, (
+            f"Gravei {nome} = {nivel} no permissions.json e no SQLite, mas o servidor "
+            f"reportou falha no reload: {resposta_reload}"
+        )
+    aplicacao = f"BDS: {resposta_reload}"
+    if mudou:
+        aplicacao += "; se ja estava online, desconecte e conecte novamente"
+    else:
+        aplicacao = "Ja estava assim; " + aplicacao
+    return True, f"{nome} = {nivel} (xuid {xuid_real})\n{aplicacao}"
 
 
 @router.callback_query(F.data.startswith("join_yes:"))
@@ -322,18 +356,28 @@ async def on_join_yes(callback: CallbackQuery, ctx: AppContext) -> None:
     _, xuid, nome_q = callback.data.split(":", 2)
     nome = unquote(nome_q)
     await callback.answer("Promovendo para member...")
-    resposta = await _promover_jogador(ctx, nome, xuid, "member", quem=callback.from_user.id, origem="/member")
+    sucesso, resposta = await _promover_jogador(
+        ctx, nome, xuid, "member", quem=callback.from_user.id, origem="/member"
+    )
+    titulo = txt.ok(f"Aprovacao de {nome}.") if sucesso else txt.erro(f"Nao consegui promover {nome}.")
     await callback.message.edit_text(
-        txt.ok(f"Aprovacao de {nome}.") + "\n" + txt.sub([resposta])
+        titulo + "\n" + txt.sub([resposta])
     )
 
 
 @router.callback_query(F.data.startswith("join_no:"))
-async def on_join_no(callback: CallbackQuery) -> None:
-    _, _xuid, nome_q = callback.data.split(":", 2)
+async def on_join_no(callback: CallbackQuery, ctx: AppContext) -> None:
+    _, xuid, nome_q = callback.data.split(":", 2)
     nome = unquote(nome_q)
-    await callback.answer("Sem promocao.")
-    await callback.message.edit_text(txt.info(f"Mantive {nome} como visitor. Pode mudar depois com /member {nome}."))
+    ctx.store.define_jogador(nome, xuid, "visitor", "declined")
+    sucesso, resposta = await _promover_jogador(
+        ctx, nome, xuid, "visitor", quem=callback.from_user.id, origem="/ops"
+    )
+    await callback.answer("Decisao salva; nao perguntarei novamente." if sucesso else "Decisao salva.")
+    texto = txt.info(f"Mantive {nome} como visitor. Nao perguntarei novamente.")
+    if not sucesso:
+        texto += "\n" + txt.aviso(resposta)
+    await callback.message.edit_text(texto)
 
 
 # ------------------------------------------------------------------ jogadores
@@ -347,8 +391,10 @@ async def cmd_ops(message: Message, command: CommandObject, ctx: AppContext) -> 
         return
     nome, nivel = args[0], args[1].lower()
     xuid = args[2] if len(args) > 2 else None
-    resposta = await _promover_jogador(ctx, nome, xuid, nivel, quem=message.from_user.id, origem="/ops")
-    if "O online-mode esta desligado" in resposta or "Nao achei o XUID" in resposta:
+    sucesso, resposta = await _promover_jogador(
+        ctx, nome, xuid, nivel, quem=message.from_user.id, origem="/ops"
+    )
+    if not sucesso and ("online-mode" in resposta or "Nao achei o XUID" in resposta):
         await message.answer(
             "\n".join(
                 [
@@ -362,6 +408,9 @@ async def cmd_ops(message: Message, command: CommandObject, ctx: AppContext) -> 
             )
         )
         return
+    if not sucesso:
+        await message.answer(txt.erro(resposta))
+        return
     await message.answer(txt.ok(resposta.splitlines()[0]) + "\n" + txt.info("\n".join(resposta.splitlines()[1:])))
 
 
@@ -373,8 +422,10 @@ async def cmd_member(message: Message, command: CommandObject, ctx: AppContext) 
         return
     nome = args[0]
     xuid = args[1] if len(args) > 1 else None
-    resposta = await _promover_jogador(ctx, nome, xuid, "member", quem=message.from_user.id, origem="/member")
-    if "Nao achei o XUID" in resposta or "online-mode" in resposta.lower():
+    sucesso, resposta = await _promover_jogador(
+        ctx, nome, xuid, "member", quem=message.from_user.id, origem="/member"
+    )
+    if not sucesso and ("Nao achei o XUID" in resposta or "online-mode" in resposta.lower()):
         await message.answer(
             "\n".join(
                 [
@@ -387,6 +438,9 @@ async def cmd_member(message: Message, command: CommandObject, ctx: AppContext) 
                 ]
             )
         )
+        return
+    if not sucesso:
+        await message.answer(txt.erro(resposta))
         return
     await message.answer(txt.ok(resposta.splitlines()[0]) + "\n" + txt.info("\n".join(resposta.splitlines()[1:])))
 
