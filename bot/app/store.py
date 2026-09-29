@@ -52,17 +52,6 @@ CREATE TABLE IF NOT EXISTS overrides (
     updated_by INTEGER,
     updated_at REAL NOT NULL
 );
-CREATE TABLE IF NOT EXISTS denied (
-    name   TEXT PRIMARY KEY COLLATE NOCASE,
-    reason TEXT,
-    by     INTEGER,
-    at     REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS liberacao (
-    name TEXT PRIMARY KEY COLLATE NOCASE,
-    by   INTEGER,
-    at   REAL NOT NULL
-);
 CREATE TABLE IF NOT EXISTS audit (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     at      REAL NOT NULL,
@@ -71,6 +60,18 @@ CREATE TABLE IF NOT EXISTS audit (
     detail  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
+
+-- A allow-list foi removida: o servidor fica aberto (allow-list=false) e quem
+-- cuida de permissao agora e' o /ops (permissions.json, por XUID). As duas
+-- tabelas e o override da propriedade sao de uma versao que nao existe mais, e
+-- ficam no .db de quem ja rodou o bot antes. Sem esta limpeza o reconciliador
+-- continuaria reescrevendo 'allow-list=true' no server.properties a cada 60s
+-- depois de a propriedade ter saido do catalogo - que e' o jeito mais barato de
+-- a lista voltar sem ninguem mandar. Tudo aqui e idempotente: rodar em cima de
+-- um .db ja limpo nao faz nada.
+DROP TABLE IF EXISTS denied;
+DROP TABLE IF EXISTS liberacao;
+DELETE FROM overrides WHERE k = 'allow-list';
 """
 
 
@@ -317,60 +318,6 @@ class Store:
     def limpa_override(self, chave: str) -> None:
         with self._lock:
             self._db.execute("DELETE FROM overrides WHERE k = ?", (chave,))
-            self._db.commit()
-
-    # -------------------------------------------------------------------- negar
-
-    def nega(self, nome: str, motivo: str | None, by: int) -> None:
-        with self._lock:
-            self._db.execute(
-                "INSERT OR REPLACE INTO denied (name, reason, by, at) VALUES (?,?,?,?)",
-                (nome, motivo, by, time.time()),
-            )
-            self._db.commit()
-
-    def permite(self, nome: str) -> None:
-        with self._lock:
-            self._db.execute("DELETE FROM denied WHERE name = ?", (nome,))
-            self._db.commit()
-
-    def negados(self) -> list[dict]:
-        with self._lock:
-            rows = self._db.execute("SELECT * FROM denied ORDER BY at DESC").fetchall()
-        return [dict(r) for r in rows]
-
-    def esta_negado(self, nome: str) -> bool:
-        with self._lock:
-            row = self._db.execute("SELECT 1 FROM denied WHERE name = ?", (nome,)).fetchone()
-        return row is not None
-
-    # -------------------------------------------------------- liberacao pendente
-
-    # A liberacao que depende de um reinicio fica anotada aqui, e nao em memoria
-    # do processo, por causa do auto-restart das 05:00: um `docker compose up -d
-    # bot` no meio da espera apagaria o timer e a liberacao ficaria pendente sem
-    # ninguem para lembrar. Anotada, ela volta sozinha no boot seguinte.
-    def marca_liberacao(self, nome: str, by: int) -> None:
-        with self._lock:
-            self._db.execute(
-                "INSERT OR REPLACE INTO liberacao (name, by, at) VALUES (?,?,?)",
-                (nome, by, time.time()),
-            )
-            self._db.commit()
-
-    def liberacoes(self) -> list[dict]:
-        with self._lock:
-            rows = self._db.execute("SELECT * FROM liberacao ORDER BY at").fetchall()
-        return [dict(r) for r in rows]
-
-    def apaga_liberacao(self, nome: str) -> None:
-        with self._lock:
-            self._db.execute("DELETE FROM liberacao WHERE name = ?", (nome,))
-            self._db.commit()
-
-    def limpa_liberacoes(self) -> None:
-        with self._lock:
-            self._db.execute("DELETE FROM liberacao")
             self._db.commit()
 
     # ---------------------------------------------------------------- auditoria

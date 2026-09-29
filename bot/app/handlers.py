@@ -60,6 +60,7 @@ BOT_COMMANDS = [
     {"command": "backup", "description": "salvar o mundo de agora e receber o link"},
     {"command": "packs", "description": "add-ons instalados"},
     {"command": "entrar", "description": "usar uma chave de leitura"},
+    {"command": "member", "description": "dar status de member a um jogador"},
     {"command": "ajuda", "description": "como usar"},
     {"command": "admin", "description": "painel do admin"},
 ]

@@ -25,8 +25,7 @@ services:
       TZ: "${TZ:-America/Sao_Paulo}"
       # Aviso importante: daqui para baixo estao SO as variaveis de primeira
       # instalacao. Nao coloque aqui gamemode, difficulty, max-players,
-      # view-distance, server-name, allow-list, white-list ou
-      # default-player-permission-level.
+      # view-distance, server-name ou default-player-permission-level.
       #
       # O image NAO reescreve o /data/server.properties inteiro: o
       # bedrock-entry.sh so passa para o arquivo as propriedades que tem
@@ -42,23 +41,24 @@ services:
       # override aqui seria reescrito no boot seguinte de qualquer jeito.
       # OFF de proposito, e e o padrao do projeto. E' o que deixa o servidor
       # aberto pra quem joga sem conta Microsoft: sem autenticacao o cliente
-      # nao tem XUID, e por isso a allowlist guarda SO o gamertag (o /permitir
-      # ignora xuid nesse modo - com o campo preenchido a entrada nunca casa).
-      #
-      # O preco: o /ops (permissions.json) casa por XUID verificado, entao com
-      # o online-mode desligado ele nao tem como funcionar. Se precisar de op,
-      # ligue com ONLINE_MODE=true no .env e reinicie.
+      # nao tem XUID, e o permissions.json (o /ops) casa so por XUID - com o
+      # online-mode desligado ele nao tem como funcionar.
+      # Se precisar de op, ligue com ONLINE_MODE=true no .env e reinicie.
       #
       # Quem manda nesta e' o .env, nao o /config do bot: a imagem reescreve
       # server.properties em todo boot (o ONLINE_MODE esta no
       # bds-property-definitions.json da imagem), entao valor gravado aqui
       # seria desfeito no restart seguinte.
-      ONLINE_MODE: "${ONLINE_MODE:-false}"
+      ONLINE_MODE: "${ONLINE_MODE:-true}"
       # Nao defina ALLOW_LIST, ALLOW_LIST_USERS, OPS, MEMBERS nem VISITORS aqui.
-      # A imagem sabe escrever allow-list e o permissions.json inteiro a cada
-      # boot a partir dessas variaveis, e sobrescreveriam o trabalho do bot:
-      # o /permitir passaria a ser um comando que o entrypoint desfaz. Quem
-      # cuida da lista e do allow-list e' o bot.
+      # A imagem sabe escrever o allowlist.json e o permissions.json inteiros a
+      # cada boot a partir dessas variaveis, e sobrescreveriam o trabalho do
+      # bot: o /ops passaria a ser um comando que o entrypoint desfaz.
+      #
+      # O servidor e' aberto (allow-list=false) e nao existe lista no bot. Se
+      # algum dia voce quiser trancar a porta, defina ALLOW_LIST=true aqui e
+      # reinicie o container - mas ai quem escreve o allowlist.json volta a ser
+      # a imagem, e nao o bot.
       LEVEL_NAME: "${LEVEL_NAME:-world}"
       # Atras de NAT (que e o caso de quase toda VPS publica) o nethernet
       # anuncia o IP privado da interface, que ninguem de fora alcanca, e o

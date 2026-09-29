@@ -47,7 +47,6 @@ No `.env`:
 | `LEVEL_NAME` | nome da pasta do mundo em `data/worlds/` (so o 1o boot usa) |
 | `UPDATE_HOUR` / `UPDATE_MINUTE` | horario do restart diario (padrao 05:00) |
 | `BOOT_TIMEOUT` | segundos que o bot espera o jogo subir (padrao 240) |
-| `ALLOWLIST_GRACE_SECONDS` | último recurso: quanto tempo o `/permitir` espera antes de reiniciar sozinho quando nem o `allowlist reload` pega (padrao 300, `0` desliga) |
 | `ONLINE_MODE` | autenticacao Microsoft no BDS (padrao `false`: entra sem conta; o preco e o `/ops`) |
 | `BACKUP_KEEP` | versoes antigas guardadas de cada pack (padrao 3) |
 
@@ -233,11 +232,6 @@ tela de packs do cliente.
 | `/config <chave> <valor>` | muda na mao (ex.: `/config difficulty hard`) |
 | `/config <chave> <valor> sim` | confirma as propriedades que pedem cuidado |
 | `/config aplicar` | reescreve em `server.properties` o que o bot guardou |
-| `/lista` | o que o servidor tem carregado, o que esta so no arquivo, a propriedade e quem esta negado |
-| `/permitir <gamertag>` | adiciona na allow-list, sem precisar de xuid (liga a lista e, se preciso, agenda o reinicio) |
-| `/removerjogador <gamertag>` | tira da allow-list |
-| `/negar <gamertag> [motivo]` | tira da lista, manda kick e marca como negado |
-| `/permitido <gamertag>` | tira da lista de negados |
 | `/ops <gamertag> <nivel> [xuid]` | permissoes do jogador (operator/member/visitor) |
 | `/chutar <gamertag> [motivo]` | expulsa agora |
 | `/chave <nome>` | cria uma chave de leitura e mostra o texto |

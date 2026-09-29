@@ -17,11 +17,13 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
+from urllib.parse import quote
+
 from aiogram import Bot, Dispatcher
 from aiogram.enums import UpdateType
-from aiogram.types import BotCommandScopeDefault
+from aiogram.types import BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
 
-from . import admin, handlers, ops, txt
+from . import admin, handlers, ops, serverctl, txt
 from .auth import AuthMiddleware
 from .config import Config, ConfigError
 from .ops import AppContext, notificar
@@ -41,7 +43,6 @@ async def reconciliador(ctx: AppContext, bot: Bot) -> None:
             if ctx.docker.state().running:
                 mudancas = await asyncio.to_thread(ops.aplica_overrides, ctx)
                 if mudancas:
-                    await asyncio.to_thread(ctx.docker.exec, "send-command", "allowlist", "reload")
                     log.info("reconciliado: %s", ", ".join(mudancas))
                     await notificar(
                         bot, ctx,
@@ -198,6 +199,63 @@ async def vigia(ctx: AppContext, bot: Bot) -> None:
         await notificar(bot, ctx, "\n".join([txt.cabecalho("👀", motivo), "", *corpo]))
 
 
+async def vigia_jogadores(ctx: AppContext, bot: Bot) -> None:
+    """Avisa os admins quando um jogador entra e pergunta se deve dar member."""
+    try:
+        logs = await asyncio.to_thread(ctx.docker.logs, lines=3000)
+    except Exception as exc:
+        log.warning("vigia_jogadores: falha na leitura inicial do log: %s", exc)
+        return
+    visto: set[tuple[str, str]] = {(nome.casefold(), xuid) for nome, xuid in serverctl.jogadores_conectados(logs)}
+
+    while True:
+        await asyncio.sleep(10)
+        try:
+            logs = await asyncio.to_thread(ctx.docker.logs, lines=3000)
+        except Exception as exc:
+            log.warning("vigia_jogadores: falha ao ler o log: %s", exc)
+            continue
+        for nome, xuid in serverctl.jogadores_conectados(logs):
+            chave = (nome.casefold(), xuid)
+            if chave in visto:
+                continue
+            visto.add(chave)
+            mensagem = (
+                txt.cabecalho("👤", "novo jogador entrou")
+                + "\n\n"
+                + txt.campo("Jogador", nome)
+                + "\n"
+                + txt.campo("XUID", xuid)
+                + "\n\n"
+                + txt.info("Ele entrou como visitor. Quero dar status de member?")
+            )
+            for user in ctx.store.usuarios():
+                if not user.eh_admin:
+                    continue
+                try:
+                    await bot.send_message(
+                        user.user_id,
+                        mensagem,
+                        reply_markup=InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(
+                                        text="✅ Sim",
+                                        callback_data=f"join_yes:{xuid}:{quote(nome)}",
+                                    ),
+                                    InlineKeyboardButton(
+                                        text="❌ Não",
+                                        callback_data=f"join_no:{xuid}:{quote(nome)}",
+                                    ),
+                                ]
+                            ]
+                        ),
+                    )
+                    log.info("avisei admin %s sobre %s (%s)", user.user_id, nome, xuid)
+                except Exception as exc:
+                    log.warning("nao consegui avisar admin %s: %s", user.user_id, exc)
+
+
 async def faxina(ctx: AppContext) -> None:
     while True:
         await asyncio.sleep(900)
@@ -239,24 +297,9 @@ async def main() -> None:
         asyncio.create_task(agendador_backup(ctx, bot)),
         asyncio.create_task(reconciliador(ctx, bot)),
         asyncio.create_task(vigia(ctx, bot)),
+        asyncio.create_task(vigia_jogadores(ctx, bot)),
         asyncio.create_task(faxina(ctx)),
     ]
-    # Depois das tasks e antes do polling: um /permitir pendente de antes do
-    # downtime volta a contar. A pendencia esta no bot.db justamente para isso -
-    # a task em si morreu com o container anterior.
-    ops.rearma_pendencia(ctx, bot)
-    # Self-heal da lista antes de qualquer admin poder usar o /permitir: num
-    # servidor sem autenticacao Microsoft, uma entrada com xuid herdada de
-    # quando exigia conta trava o jogador sem erro nenhum. Roda aqui, no boot.
-    try:
-        curados = await ops.cura_offline(ctx)
-    except Exception:
-        # A cura e' melhoria, nao condicao de boot: se ela falhar o bot ainda
-        # serve, e o /lista mostra quem ficou preso.
-        log.exception("falha ao curar a allowlist para modo offline")
-        curados = []
-    if curados:
-        log.info("allowlist sem xuid (online-mode desligado): %s", ", ".join(curados))
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         if admins:
@@ -286,11 +329,6 @@ async def main() -> None:
     finally:
         for task in tasks:
             task.cancel()
-        if ctx.tarefa_liberacao is not None:
-            # O cancelamento e' o de sempre: a pendencia continua no bot.db e o
-            # boot seguinte rearma. Encerrar o bot nao e' um "cancelou" - e a
-            # diferenca entre o prazo sobreviver a um restart e sumir.
-            ctx.tarefa_liberacao.cancel()
         await bot.session.close()
         ctx.store.fecha()
 

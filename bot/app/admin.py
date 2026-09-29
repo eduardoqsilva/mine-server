@@ -1,7 +1,11 @@
-"""Comandos do admin: configs, chaves de acesso, lista, negados, reinicio, auditoria.
+"""Comandos do admin: configs, chaves de acesso, jogadores, reinicio, auditoria.
 
 Tudo neste arquivo e bloqueado para quem nao e admin: o filtro RoleAdmin no
 router, e o middleware que injeta `sessao` so para quem tem papel.
+
+Nao ha lista de permissao aqui: o servidor e' aberto (allow-list=false) e quem
+entra e' qualquer um. As duas coisas de jogador que sobraram sao o /ops
+(permissions.json, por XUID) e o /chutar.
 """
 
 from __future__ import annotations
@@ -9,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+from urllib.parse import quote, unquote
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
@@ -39,16 +44,13 @@ AJUDA_ADMIN = "\n".join(
         txt.secao("👥", "jogadores"),
         txt.sub(
             [
-                "/lista  - quem pode entrar (o que o servidor tem, o que so esta no arquivo)",
-                "/permitir <gamertag>  - adiciona na lista, sem precisar de xuid",
-                "  se o console nao responder, eu mando o reload; se nem isso pegar, marco como",
-                "  pendente e reinicio sozinho",
-                "/removerjogador <gamertag>  - tira da lista",
-                "/negar <gamertag> [motivo]  - tira da lista e expulsa se estiver online",
-                "/permitido <gamertag>  - volta a liberar",
+                "O servidor e' aberto: qualquer um entra, sem lista.",
+                "novos jogadores entram como visitor e o bot pergunta se quero dar member.",
                 "/ops <gamertag> <operator|member|visitor> [xuid]  - permissoes do jogador",
+                "/member <gamertag> [xuid]  - atalho para dar member ao jogador",
                 "  so funciona com online-mode ligado: o permissions.json casa por xuid",
                 "/chutar <gamertag> [motivo]  - expulsa agora",
+                "  quem esta online: /console list",
             ]
         ),
         txt.secao(txt.CHAVES, "acesso ao bot"),
@@ -66,6 +68,9 @@ AJUDA_ADMIN = "\n".join(
                 "/reiniciar [motivo]  - reinicia o servidor",
                 "/anunciar <texto>  - fala no chat do jogo",
                 "/console <comando>  - comando no console do BDS, com a resposta",
+                "  qualquer texto que o BDS aceite, sem restricao: gamerule, tps,",
+                "  time set day, allowlist off, list, help...",
+                "  eu mostro na mesma mensagem o que o servidor respondeu",
                 "/backup  - salva o mundo de agora e manda o link",
                 "/backups  - o que existe de backup, sem copiar nada",
                 "/log [n]  - ultimas linhas do log",
@@ -91,7 +96,6 @@ MENU_CONFIG: list[tuple[str, str, str]] = [
     ("max-players", "Maximo de jogadores", "numero"),
     ("view-distance", "Distancia de visao", "numero"),
     ("server-name", "Nome do servidor", "texto (sem ';')"),
-    ("allow-list", "Lista ligada", "true/false"),
     ("allow-cheats", "Permite cheats", "true/false"),
     ("hide-online-players", "Esconde quem esta online", "true/false"),
     ("default-player-permission-level", "Permissao padrao", "visitor/member/operator"),
@@ -106,10 +110,10 @@ def _clip(texto: str, limite: int = 3800) -> str:
 def _tokens(bruto: str) -> list[str]:
     """Quebra o que veio depois do comando, com aspas agrupando.
 
-    A doc do BDS exige aspas em gamertag com espaco, entao o mesmo vale aqui: o
-    nome e o primeiro token, e '/permitir "Ze Do Zero"' e' o jeito de escrever
-    o nome inteiro. Aspas desbalanceadas nao podem derrubar o bot no meio de um
-    comando, entao nesse caso cai para um split simples.
+    Gamertag com espaco precisa vir entre aspas, entao '/ops "Ze Do Zero"
+    operator' e' o jeito de escrever o nome inteiro. Aspas desbalanceadas nao
+    podem derrubar o bot no meio de um comando, entao nesse caso cai para um
+    split simples.
     """
     try:
         return shlex.split(bruto)
@@ -118,24 +122,6 @@ def _tokens(bruto: str) -> list[str]:
         # '"Ze' como se fosse o nome: o admin recebe 'faltou aspa' em vez de
         # uma entrada que nunca vai casar com o jogador.
         return bruto.replace('"', " ").split()
-
-
-def _nome_e_xuid(bruto: str) -> tuple[str, str | None, str]:
-    """(gamertag, xuid, sobra) do que veio depois de um /permitir.
-
-    O xuid e opcional, entao sobra so sobra quando sobrou alguma coisa que nao
-    e numero: e o sinal de que o nome veio sem aspas ('/permitir Ze Do Zero'
-    seria lido como 'Ze' com sobra 'Do Zero'). O chamador avisa em vez de
-    liberar o jogador errado em silencio.
-    """
-    partes = _tokens(bruto)
-    if not partes:
-        return "", None, ""
-    nome = partes[0]
-    resto = partes[1:]
-    if resto and resto[-1].isdigit():
-        return nome, resto[-1], " ".join(resto[:-1])
-    return nome, None, " ".join(resto)
 
 
 def _menu_config(props: dict[str, str]) -> InlineKeyboardMarkup:
@@ -211,24 +197,7 @@ async def cmd_config(message: Message, command: CommandObject, ctx: AppContext) 
             ctx.store.set_override(chave, valor, message.from_user.id)
         ctx.store.audita(message.from_user.id, "config", f"{chave}={valor}")
 
-        # allow-list tem comando de console, entao nao precisa derrubar o
-        # servidor. So que o comando nao mexe no server.properties (a doc do BDS
-        # e explicita), e por isso o set_prop acima continua de pe.
-        ao_vivo = serverctl.comando_ao_vivo(chave, valor)
         aviso = prop.reinicia
-        fora_do_console = ""
-        if ao_vivo:
-            erro, _linhas = await asyncio.to_thread(ctx.docker.console, ao_vivo)
-            if not erro:
-                aviso = False
-            else:
-                fora_do_console = (
-                    "\n"
-                    + txt.aviso("O console nao aceitou o comando, entao vou reiniciar:")
-                    + "\n"
-                    + txt.sub([erro])
-                )
-
         espera = ctx.config.announce_seconds + 25
         if aviso:
             rodape = (
@@ -248,7 +217,7 @@ async def cmd_config(message: Message, command: CommandObject, ctx: AppContext) 
                     "propriedade em todo boot."
                 )
             )
-        await message.answer(txt.ok(f"{chave} = {valor} gravado.") + fora_do_console + rodape)
+        await message.answer(txt.ok(f"{chave} = {valor} gravado.") + rodape)
         if aviso:
             relatorio = await ops.restart_server(ctx, f"config {chave}")
             await message.answer(_clip(relatorio))
@@ -320,309 +289,54 @@ async def on_config_button(callback: CallbackQuery, ctx: AppContext) -> None:
     await callback.message.edit_text("\n".join(linhas))
 
 
-# ------------------------------------------------------------------ jogadores
+async def _resolva_xuid(ctx: AppContext, nome: str, xuid: str | None) -> str | None:
+    if xuid is not None:
+        return xuid
+    log_txt = ctx.docker.logs(lines=1500)
+    return ctx.server.xuid_no_log(nome, log_txt)
 
 
-def _teclado_liberacao() -> InlineKeyboardMarkup:
-    """O botao que antecipa o reinicio. O prazo roda sozinho de qualquer jeito."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="⏩ Reiniciar agora e liberar", callback_data="lib:agora"),
-                InlineKeyboardButton(text="Cancelar", callback_data="lib:cancelar"),
-            ]
-        ]
-    )
-
-
-@router.message(Command("lista"))
-async def cmd_lista(message: Message, ctx: AppContext) -> None:
-    # As tres fontes (console, arquivo e propriedade) sao lidas de uma vez e
-    # mostradas lado a lado. Enquanto cada tela montava a sua versao, elas
-    # discordavam - e o bot acabava descrevendo o arquivo como se fosse a lista.
-    estado = await asyncio.to_thread(ops.estado_real, ctx)
-    negados = ctx.store.negados()
-    pendentes = [r["name"] for r in estado.pendentes]
-
-    linhas = [txt.cabecalho(txt.JOGADORES, "lista de acesso"), ""]
-    # O console e' o que vale AGORA. O arquivo conta outra historia: o BDS le
-    # ele no boot e o reescreve no stop, entao ele descreve o passado.
-    linhas.append(txt.secao(txt.CONSOLE, "o que o servidor tem agora"))
-    if estado.erro_console:
-        linhas += [
-            "",
-            txt.aviso("nao consegui ler do console: " + estado.erro_console),
-            txt.sub(["o resto desta tela e' so o arquivo; sem o console eu nao sei o que vale agora"]),
-        ]
-    elif not estado.linhas_servidor:
-        linhas.append(txt.sub(["(o console nao devolveu nada)"]))
-    else:
-        linhas += [txt.sub([l]) for l in estado.linhas_servidor]
-
-    # A divergencia e' o bug antigo, escrito: gente no arquivo que o servidor
-
-    # nao tem. Ela nao entra no jogo, e um "restart" resolveria apagando a prova.
-    so_arquivo = estado.so_no_arquivo()
-    if so_arquivo:
-        linhas += [
-            "",
-            txt.secao(txt.AVISO, "no arquivo, mas NAO no servidor", len(so_arquivo)),
-            txt.sub(["esta gente NAO entra: o BDS consulta a lista que tem em memoria"]),
-        ]
-        linhas += [txt.sub([f"• {nome}"]) for nome in so_arquivo]
-        linhas.append(
-            txt.sub(["um 'allowlist reload' resolve sem derrubar o servidor: /permitir de novo faz isso"])
+async def _promover_jogador(ctx: AppContext, nome: str, xuid: str | None, nivel: str, *, quem: int, origem: str) -> str:
+    if not ctx.server.online_mode():
+        return (
+            "O online-mode esta desligado, entao o permissions.json nao consegue casar o jogador "
+            f"por XUID. Ative ONLINE_MODE=true no .env e reinicie o servidor para aceitar {nome} como {nivel}."
         )
-    if estado.whitelist_antigo:
-        linhas += [
-            "",
-            txt.aviso(
-                "existe um /data/whitelist.json: ele tem preferencia sobre o allowlist.json "
-                "enquanto existir. Apague-o, senao ele continua mandando na lista."
-            ),
-        ]
-
-    # A propriedade decide o proximo boot, e e a unica coisa que o boot le.
-    ligado = estado.allow_list_arquivo == "true"
-    linhas += [
-        "",
-        txt.secao("⚙️", "no arquivo (vale no proximo boot)"),
-        txt.sub(
-            [
-                f"allow-list = {estado.allow_list_arquivo or '(nao definido)'}",
-                "lista LIGADA" if ligado else "lista DESLIGADA: qualquer um pode entrar",
-            ]
-        ),
-    ]
-
-    linhas.append(txt.secao("📄", "no allowlist.json", len(estado.entradas_arquivo)))
-    if estado.erro_arquivo:
-        linhas.append(txt.erro(estado.erro_arquivo))
-    elif estado.entradas_arquivo:
-        for item in estado.entradas_arquivo:
-            xuid = item.get("xuid")
-            preso = xuid and not estado.online_mode
-            if preso:
-                rotulo = "  (PRESO: xuid com online-mode desligado - nunca vai casar)"
-            elif xuid:
-                rotulo = f"  (xuid {xuid})"
-            else:
-                rotulo = "  (so o nome)"
-            linhas.append(txt.sub([f"{item.get('name', '?')}{rotulo}"]))
-    else:
-        linhas.append(txt.sub(["(ninguem ainda)"]))
-
-    presas = estado.entradas_presas()
-    if presas:
-        linhas += [
-            "",
-            txt.aviso(
-                "online-mode esta DESLIGADO, e estas entradas ainda tem xuid: "
-                + ", ".join(presas)
-                + ". Sem autenticacao o cliente nao tem XUID, entao o servidor compara um numero que "
-                "nunca vai bater e o jogador fica de fora mesmo estando na lista. O bot tira o campo no "
-                "boot; para mandar agora, /permitir de novo."
-            ),
-        ]
-
-    if pendentes:
-        linhas.append(txt.secao("⏳", "liberacoes pendentes", len(pendentes)))
-        linhas.append(txt.sub(["ainda nao valem; eu reinicio sozinho para fazer valer"]))
-        for nome in pendentes:
-            linhas.append(txt.sub([f"• {nome}"]))
-    if negados:
-        linhas.append(txt.secao("🚫", "negados", len(negados)))
-        linhas.append(txt.sub(["Nao voltam a lista sem /permitido <gamertag>"]))
-        for d in negados:
-            motivo = f" — {d['reason']}" if d.get("reason") else ""
-            linhas.append(txt.sub([f"{d['name']}{motivo}"]))
-    await message.answer(
-        _clip("\n".join(linhas)),
-        reply_markup=_teclado_liberacao() if pendentes else None,
-    )
-
-
-@router.message(Command("permitir"))
-async def cmd_permitir(message: Message, command: CommandObject, ctx: AppContext) -> None:
-    nome, xuid, sobra = _nome_e_xuid(command.args or "")
-    if not nome:
-        await message.answer(txt.info('Uso: /permitir <gamertag>  ("aspas" se o nome tiver espaco)'))
-        return
-    if sobra:
-        # o nome quase certeza veio sem aspas; liberar 'Ze' quando o
-        # jogador se chama 'Ze Do Zero' nao da erro nenhum, so nao entra
-        await message.answer(
-            "\n".join(
-                [
-                    txt.erro(f"'{sobra}' nao faz parte do gamertag."),
-                    txt.info("Se o nome tem espaco, escreva entre aspas:"),
-                    txt.sub([f'/permitir "{nome} {sobra}"']),
-                ]
-            )
+    xuid_real = await _resolva_xuid(ctx, nome, xuid)
+    if xuid_real is None:
+        return (
+            f"Nao achei o XUID de {nome} no log do servidor. "
+            f"Espere o player entrar e tente de novo, ou mande {origem} com o XUID manualmente."
         )
-        return
-    if ctx.store.esta_negado(nome):
-        await message.answer(
-            txt.erro(f"{nome} esta na lista de negados. Use /permitido {nome} primeiro.")
-        )
-        return
-    # O xuid e opcional e so um atalho. A doc do BDS: "you don't need to
-    # specify a XUID here, it will be resolved the first time the player
-    # connects". Exigir o numero barraria justamente quem nunca conseguiu
-    # entrar, e o numero adivinhado no log, quando errado, trava o jogador em
-    # vez de liberar.
-    ctx.store.audita(message.from_user.id, "permitir", nome)
-
-    sem_xbl = not ctx.server.online_mode()
-    liberacao = await ops.poe_na_lista(ctx, nome, None if sem_xbl else xuid)
-    lista = await ops.liga_a_lista(ctx, message.from_user.id)
-
-    corpo = [txt.cabecalho("👥", "liberar jogador"), "", txt.campo("Nome", nome), ""]
-    if sem_xbl:
-        aviso_offline = (
-            "online-mode desligado: o jogador entra sem conta Microsoft e a lista guarda "
-            "so o gamertag, que e' o que o servidor consegue casar."
-        )
-        corpo.append(txt.sub([aviso_offline]))
-        corpo.append("")
-    teclado = None
-    if liberacao.estado == ops.LIBERADO:
-        corpo.append(txt.ok(f"{nome} esta na lista que o servidor tem carregada. Pode entrar."))
-        if liberacao.aviso:
-            corpo += ["", txt.info(liberacao.aviso)]
-        corpo += ["", txt.info("Foi sem reiniciar: vale para o servidor que esta rodando.")]
-    elif liberacao.estado == ops.LIBERADO_BOOT:
-        corpo.append(
-            txt.ok(f"{nome} entrou no allowlist.json e o servidor esta parado, entao o proximo boot le isso.")
-        )
-        if liberacao.aviso:
-            corpo += ["", txt.info(liberacao.aviso)]
-    elif liberacao.estado == ops.LIBERADO_FALHOU:
-        corpo += [
-            txt.erro(liberacao.aviso),
-            "",
-            txt.sub(["veja o arquivo: /data/allowlist.json, e /lista para o diagnostico"]),
-        ]
-    else:
-        # So no arquivo com o BDS rodando: ainda nao vale. Aqui o bot assume o
-        # reinicio - o botao e' o atalho, nao a permissao que falta.
-        corpo.append(txt.aviso(liberacao.aviso))
-        corpo += ["", await ops.agenda_liberacao(ctx, [nome], message.from_user.id, message.bot)]
-        teclado = _teclado_liberacao()
-    if lista:
-        corpo += ["", txt.info(lista)]
-    await message.answer(_clip("\n".join(corpo)), reply_markup=teclado)
-
-
-@router.callback_query(F.data.startswith("lib:"))
-async def on_liberacao(callback: CallbackQuery, ctx: AppContext) -> None:
-    """Botao do /permitir: antecipa o reinicio, ou cancela o prazo.
-
-    O prazo nao e' uma permissao que o admin precise dar - ela ja foi dada no
-    /permitir. O botao existe porque 5 minutos de porta fechada sao 5 minutos de
-    reclamacao, e porque 'eu espero o timer' e' melhor do que o admin nao saber
-    se o bot vai cumprir o que prometeu.
-    """
-    pendentes = [r["name"] for r in ctx.store.liberacoes()]
-    if not pendentes:
-        await callback.answer("Nada pendente: essa liberacao ja foi concluida.", show_alert=True)
-        return
-
-    if callback.data == "lib:cancelar":
-        if ctx.liberacao_em_curso:
-            # O timer ja disparou e o servidor ja esta no chao. Dizer "cancelado"
-            # aqui seria o oposto de honesto: o mundo esta parado, o release vai
-            # terminar sozinho.
-            await callback.answer("O reinicio ja comecou, nao da para cancelar.", show_alert=True)
-            return
-        ctx.store.limpa_liberacoes()
-        ops.cancela_agenda(ctx)
-        await callback.answer("Cancelei.")
-        await callback.message.edit_text(
-            txt.aviso("Liberacao cancelada. As entradas ficaram no allowlist.json, sem efeito.")
-        )
-        return
-
-    ops.cancela_agenda(ctx)
-    await callback.answer("Reiniciando...")
-    quem = ", ".join(pendentes)
-    await callback.message.edit_text(txt.info(f"Reiniciando para liberar {quem}..."))
-    relatorio = await ops.dispara_pendente(ctx)
     try:
-        await callback.message.edit_text(_clip(relatorio))
-    except Exception:  # noqa: BLE001 - a mensagem pode ser velha demais para editar
-        await callback.message.answer(_clip(relatorio))
+        mudou = await asyncio.to_thread(ctx.server.set_permissao, nome, xuid_real, nivel)
+    except serverctl.PropertyError as exc:
+        return str(exc)
+    ctx.store.audita(quem, "ops", f"{nome}={nivel} xuid={xuid_real}")
+    await asyncio.to_thread(ctx.docker.exec, "send-command", "permission", "reload")
+    return f"{nome} = {nivel} (xuid {xuid_real})\n" + ("Recarregado sem reiniciar." if mudou else "Ja estava assim.")
 
 
-@router.message(Command("removerjogador"))
-async def cmd_remover_jogador(message: Message, command: CommandObject, ctx: AppContext) -> None:
-    nome = " ".join(_tokens(command.args or ""))
-    if not nome:
-        await message.answer(txt.info('Uso: /removerjogador <gamertag>  ("aspas" se o nome tiver espaco)'))
-        return
-    saiu, aviso = await ops.tira_da_lista(ctx, nome)
-    ctx.store.audita(message.from_user.id, "removerjogador", nome)
-    if aviso:
-        cabecalho = txt.ok(f"{nome} saiu da lista.") if saiu else txt.ok(f"{nome} nao estava na lista.")
-        await message.answer("\n".join([cabecalho, txt.aviso(aviso)]))
-        return
-    await message.answer(
-        txt.ok(f"{nome} saiu da lista.")
-        if saiu
-        else txt.info(f"{nome} nao estava na lista.")
+@router.callback_query(F.data.startswith("join_yes:"))
+async def on_join_yes(callback: CallbackQuery, ctx: AppContext) -> None:
+    _, xuid, nome_q = callback.data.split(":", 2)
+    nome = unquote(nome_q)
+    await callback.answer("Promovendo para member...")
+    resposta = await _promover_jogador(ctx, nome, xuid, "member", quem=callback.from_user.id, origem="/member")
+    await callback.message.edit_text(
+        txt.ok(f"Aprovacao de {nome}.") + "\n" + txt.sub([resposta])
     )
 
 
-@router.message(Command("negar"))
-async def cmd_negar(message: Message, command: CommandObject, ctx: AppContext) -> None:
-    args = _tokens(command.args or "")
-    if not args:
-        await message.answer(txt.info('Uso: /negar <gamertag> [motivo]  ("aspas" se o nome tiver espaco)'))
-        return
-    nome = args[0]
-    motivo = " ".join(args[1:]) or None
-    _saiu, aviso = await ops.tira_da_lista(ctx, nome)
-    ctx.store.nega(nome, motivo, message.from_user.id)
-    ctx.store.audita(message.from_user.id, "negar", f"{nome} ({motivo or 'sem motivo'})")
-    kicked = await asyncio.to_thread(ctx.docker.exec, "send-command", "kick", nome, motivo or "fora do servidor")
-    # o Bedrock nao tem denylist: quem nao esta na allowlist nao entra.
-    props = await asyncio.to_thread(ctx.server.le_props)
-    linhas = [
-        txt.cabecalho("🚫", "jogador negado"),
-        "",
-        txt.ok(f"{nome}: saiu da lista, kick enviado."),
-    ]
-    linhas.append(
-        txt.sub([f"Resposta do servidor: {kicked.strip()[:200]}"])
-        if kicked.strip()
-        else txt.sub(["Ele nao estava online."])
-    )
-    if aviso:
-        linhas += ["", txt.aviso(aviso)]
-    if props.get("allow-list") != "true":
-        linhas += [
-            "",
-            txt.aviso(
-                "A allow-list esta DESLIGADA, entao ele ainda consegue entrar. "
-                "Ligue com: /config allow-list true"
-            ),
-        ]
-    await message.answer("\n".join(linhas))
+@router.callback_query(F.data.startswith("join_no:"))
+async def on_join_no(callback: CallbackQuery) -> None:
+    _, _xuid, nome_q = callback.data.split(":", 2)
+    nome = unquote(nome_q)
+    await callback.answer("Sem promocao.")
+    await callback.message.edit_text(txt.info(f"Mantive {nome} como visitor. Pode mudar depois com /member {nome}."))
 
 
-@router.message(Command("permitido"))
-async def cmd_permitido(message: Message, command: CommandObject, ctx: AppContext) -> None:
-    nome = " ".join(_tokens(command.args or ""))
-    if not nome:
-        await message.answer(txt.info('Uso: /permitido <gamertag>  ("aspas" se o nome tiver espaco)'))
-        return
-    ctx.store.permite(nome)
-    ctx.store.audita(message.from_user.id, "permitido", nome)
-    await message.answer(
-        txt.ok(f"{nome} nao esta mais Negado.")
-        + "\n"
-        + txt.info(f"Use /permitir {nome} para ele voltar a entrar na lista.")
-    )
+# ------------------------------------------------------------------ jogadores
 
 
 @router.message(Command("ops"))
@@ -633,63 +347,48 @@ async def cmd_ops(message: Message, command: CommandObject, ctx: AppContext) -> 
         return
     nome, nivel = args[0], args[1].lower()
     xuid = args[2] if len(args) > 2 else None
-    # Sem autenticacao nao existe xuid, e o permissions.json e' uma lista de
-    # xuid. Melhor recusar dizendo por que do que aceitar e nao surtir efeito.
-    if not ctx.server.online_mode():
-        motivo_ops = (
-            'A doc do BDS e' " explicita: online-mode precisa estar ligado para o "
-            "permissions.json funcionar, porque o xuid exige verificacao online da conta."
-        )
+    resposta = await _promover_jogador(ctx, nome, xuid, nivel, quem=message.from_user.id, origem="/ops")
+    if "O online-mode esta desligado" in resposta or "Nao achei o XUID" in resposta:
         await message.answer(
             "\n".join(
                 [
-                    txt.cabecalho("👤", "/ops precisa de autenticacao"),
+                    txt.cabecalho("👤", "preciso do xuid"),
                     "",
-                    txt.erro("O online-mode esta desligado, entao nao existe xuid para casar."),
+                    txt.erro(resposta),
                     "",
-                    txt.sub([motivo_ops]),
-                    "",
-                    txt.info("Se quiser op, ponha no .env:"),
-                    txt.sub(["ONLINE_MODE=true"]),
-                    txt.info("e recrie o container, porque a propriedade vive no bds:"),
+                    txt.info("Se quiser usar permissao por XUID, ative ONLINE_MODE=true no .env."),
                     txt.sub(["docker compose up -d bds"]),
-                    "",
-                    txt.info("A allow-list funciona offline. So o /ops que nao."),
                 ]
             )
         )
         return
-    if xuid is None:
-        log_txt = ctx.docker.logs(lines=1500)
-        xuid = ctx.server.xuid_no_log(nome, log_txt)
-        if xuid is None:
-            await message.answer(
-                "\n".join(
-                    [
-                        txt.cabecalho("👤", "preciso do xuid"),
-                        "",
-                        txt.erro(f"O permissions.json funciona por XUID, e nao achei o de {nome}."),
-                        "",
-                        txt.info("Pegue no log do servidor:"),
-                        txt.sub([f"docker compose logs bds | grep {nome}"]),
-                        txt.info("Ou em mcprofile.io. Depois mande:"),
-                        txt.sub([f"/ops {nome} {nivel} 2535453759792258"]),
-                    ]
-                )
-            )
-            return
-    try:
-        mudou = await asyncio.to_thread(ctx.server.set_permissao, nome, xuid, nivel)
-    except serverctl.PropertyError as exc:
-        await message.answer(txt.erro(str(exc)))
+    await message.answer(txt.ok(resposta.splitlines()[0]) + "\n" + txt.info("\n".join(resposta.splitlines()[1:])))
+
+
+@router.message(Command("member"))
+async def cmd_member(message: Message, command: CommandObject, ctx: AppContext) -> None:
+    args = _tokens(command.args or "")
+    if not args:
+        await message.answer(txt.info('Uso: /member <gamertag> [xuid]  ("aspas" se o nome tiver espaco)'))
         return
-    ctx.store.audita(message.from_user.id, "ops", f"{nome}={nivel} xuid={xuid}")
-    await asyncio.to_thread(ctx.docker.exec, "send-command", "permission", "reload")
-    await message.answer(
-        txt.ok(f"{nome} = {nivel} (xuid {xuid})")
-        + "\n"
-        + txt.info("Recarregado sem reiniciar." if mudou else "Ja estava assim.")
-    )
+    nome = args[0]
+    xuid = args[1] if len(args) > 1 else None
+    resposta = await _promover_jogador(ctx, nome, xuid, "member", quem=message.from_user.id, origem="/member")
+    if "Nao achei o XUID" in resposta or "online-mode" in resposta.lower():
+        await message.answer(
+            "\n".join(
+                [
+                    txt.cabecalho("👤", "member"),
+                    "",
+                    txt.erro(resposta),
+                    "",
+                    txt.info("Se o jogador ja entrou, o XUID aparecera no log do servidor."),
+                    txt.sub([f"/member {nome} 2535453759792258"]),
+                ]
+            )
+        )
+        return
+    await message.answer(txt.ok(resposta.splitlines()[0]) + "\n" + txt.info("\n".join(resposta.splitlines()[1:])))
 
 
 @router.message(Command("chutar"))
@@ -846,9 +545,14 @@ async def cmd_anunciar(message: Message, command: CommandObject, ctx: AppContext
 async def cmd_console(message: Message, command: CommandObject, ctx: AppContext) -> None:
     """Manda um comando no console do BDS e mostra a resposta na mesma mensagem.
 
-    Escapa de rotas que ainda nao existem no bot: qualquer palavra que o BDS
-    aceite ('gamerule', 'tps', 'time set day', 'whitelist on') vai direto. E a
-    unica forma de mexer em algo que o catalogo do /config nao cobre.
+    Sem filtro: o texto vai inteiro para o console, do jeito que o admin
+    escreveu. Serve tanto para o que o catalogo do /config nao cobre ('gamerule',
+    'tps', 'time set day') quanto para o que ele cobre, porque o comando do
+    console e' o caminho sem reinicio.
+
+    A resposta vem do log do container (o send-command da imagem escreve no
+    stdin do BDS e sai; o que o servidor fala sai no stdout), e volta na mesma
+    mensagem - com o carimbo e o eco do proprio comando removidos.
     """
     texto = (command.args or "").strip()
     if not texto:
@@ -857,12 +561,15 @@ async def cmd_console(message: Message, command: CommandObject, ctx: AppContext)
                 [
                     txt.info("Uso: /console <comando>"),
                     "",
+                    txt.info("Voce escreve o que quiser; eu mando tudo e mostro a resposta."),
                     txt.sub(
                         [
                             "/console list",
                             "/console help",
                             "/console tps",
                             "/console gamerule doDaylightCycle false",
+                            "/console time set day",
+                            "/console allowlist off",
                         ]
                     ),
                 ]

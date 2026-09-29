@@ -1,4 +1,4 @@
-"""Controle do servidor: server.properties, allowlist.json, permissions.json e kicks.
+"""Controle do servidor: server.properties, permissions.json e kicks.
 
 O bot e o dono do /data/server.properties. O image nao reescreve o arquivo
 inteiro: o bedrock-entry.sh so joga nele as propriedades que tem variavel de
@@ -11,6 +11,10 @@ La quem manda e o compose, porque a imagem reescreve as duas em todo boot. O
 bot ainda deixa o /config escrever no arquivo (para o admin ver o valor
 mudando), mas nao guarda override delas: o reconciliador ficaria reescrevendo
 algo que o boot seguinte desfaz.
+
+A allow-list nao esta no catalogo de proposito: o servidor e' aberto
+(allow-list=false) e quem entra e' qualquer um. Permissao no jogo continua
+sendo o /ops, que escreve no permissions.json - essa parte e' mantida.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from pathlib import Path
 log = logging.getLogger("bds.server")
 
 XUID_RE = re.compile(r"\b\d{15,20}\b")
+PLAYER_CONNECTED_RE = re.compile(r"Player connected:\s*(?P<nome>.+?)/(?P<xuid>\d{15,20})\s*$", re.IGNORECASE)
 
 BACKUP_SUFFIX = ".bak"
 
@@ -86,7 +91,6 @@ CATALOGO: tuple[Prop, ...] = (
     Prop("enforce-secure-profile", "Exige perfil seguro", "bool"),
     Prop("server-authoritative-movement", "Movimento autoritativo", "bool"),
     Prop("player-idle-timeout", "Desloga apos X min parado", "int"),
-    Prop("allow-list", "Lista ligada (so quem esta na lista entra)", "bool"),
     Prop(
         "server-port",
         "Porta do jogo",
@@ -141,42 +145,15 @@ POR_CHAVE = {p.key: p for p in CATALOGO}
 #
 # Vale notar o que NAO esta aqui: allow-list. A imagem tambem sabe escreve-la
 # (ALLOW_LIST), mas enquanto ninguem definir essa variavel o entry script nao
-# toca na propriedade, e o bot continua sendo o dono dela - e o dono do
-# allowlist.json. Definir ALLOW_LIST ou ALLOW_LIST_USERS no .env faz a imagem
-# sobrescrever o allowlist.json inteiro em todo boot, e o /permitir volta a ser
-# um comando que o BDS desfaz sozinho.
+# toca na propriedade, e o arquivo continua valendo false - o servidor fica
+# aberto. Definir ALLOW_LIST=true no .env ligaria a lista em todo boot; o
+# /config nao expoe a chave justamente para ninguem liga-la sem querer.
 DO_COMPOSE: frozenset[str] = frozenset({"level-name", "server-udp-ports", "online-mode"})
 
 
 def do_compose(chave: str) -> bool:
     """Essa propriedade e reescrita pelo compose em todo boot?"""
     return chave in DO_COMPOSE
-
-
-def comando_ao_vivo(chave: str, valor: str) -> str:
-    """O comando de console que aplica a propriedade sem reiniciar ('' se nao ha).
-
-    Vale para as duas que o BDS le ao vivo. O resto (dificuldade, distancia de
-    visao, gamemode) so entra no proximo boot, e nao ha comando para isso: a
-    doc do BDS so traz changesetting para allow-cheats e difficulty.
-    """
-    if chave == "allow-list":
-        # A doc e explicita: allowlist on/off liga e desliga em runtime e "does
-        # not change the value in the server.properties file". Por isso o
-        # /config continua gravando o arquivo tambem - o comando sozinho
-        # resolveria so ate o proximo boot.
-        return "allowlist on" if valor == "true" else "allowlist off"
-    return ""
-
-
-def cita(nome: str) -> str:
-    """Como o gamertag tem que ir num comando de console do BDS.
-
-    A doc oficial: "If there is a white-space in the Gamertag you need to
-    enclose it with double quotes". Sem aspas, 'allowlist add Example Name'
-    vira duas palavras e o servidor nunca acha o jogador.
-    """
-    return f'"{nome}"' if any(c.isspace() for c in nome) else nome
 
 
 def interpreta_config(args: list[str]) -> tuple[str, str, bool] | None:
@@ -274,20 +251,13 @@ class ServerControl:
         self.data_dir = data_dir
         self.backup_keep = backup_keep
         self.props_path = data_dir / "server.properties"
-        self.allowlist_path = data_dir / "allowlist.json"
         self.permissions_path = data_dir / "permissions.json"
-        # A doc do BDS avisa: "if a whitelist.json file is also present, it will
-        # be used instead of allowlist.json". O nome e' o antigo, de quando a
-        # lista se chamava whitelist, mas o arquivo continua valendo. Se ele
-        # existir, tudo que o bot grava no allowlist.json e' ignorado pelo
-        # servidor - em silencio, sem erro no log. Por isso a deteccao existe.
-        self.whitelist_path = data_dir / "whitelist.json"
 
     def _podar_backups(self, caminho: Path) -> None:
         """Mantem so os backup_keep mais novos de um arquivo.
 
-        Sem isso o /data enche: toda gravacao de allow-list e de permissions
-        deixa um .bak para tras e ninguem limpava.
+        Sem isso o /data enche: toda gravacao de permissions deixa um .bak
+        para tras e ninguem limpava.
         """
         velhos = sorted(self.data_dir.glob(caminho.name + ".*" + BACKUP_SUFFIX))
         for velho in velhos[: max(0, len(velhos) - self.backup_keep)]:
@@ -350,7 +320,7 @@ class ServerControl:
         """O nome da pasta do mundo: o arquivo manda, nao o .env."""
         return self.le_props().get("level-name", "").strip() or padrao
 
-    # -------------------------------------------------------------- allow/deny
+    # -------------------------------------------------------------- permissoes
 
     def _lista(self, caminho: Path) -> list[dict]:
         if not caminho.is_file():
@@ -370,143 +340,19 @@ class ServerControl:
             self._podar_backups(caminho)
         caminho.write_text(json.dumps(dados, indent=2) + "\n", encoding="utf-8")
 
-    def allowlist(self) -> list[dict]:
-        return self._lista(self.allowlist_path)
-
-    def tem_whitelist_json(self) -> bool:
-        """O arquivo antigo (whitelist.json) esta presente?
-
-        Se estiver, o BDS le ele em vez do allowlist.json - a doc oficial e
-        explicita: "if a whitelist.json file is also present, it will be used
-        instead of allowlist.json". E' um esconderijo: o bot grava a lista
-        certa, o /lista mostra a lista certa, e o servidor consulta a outra.
-        """
-        return self.whitelist_path.is_file()
-
     def online_mode(self) -> bool:
         """O servidor exige autenticacao Microsoft? (padrao do BDS: sim)
 
-        Importa mais do que parece, porque e' o que decide se a allowlist pode
-        carregar xuid. A doc do BDS e' explicita: o permissions.json "needs
-        online-mode to be enabled since xuid requires online verification of the
-        user account", e o mesmo XUID e' a chave com que a allowlist casa o
-        jogador. Sem autenticacao o cliente nao tem XUID, e uma entrada com o
-        campo preenchido vira um numero que nunca vai bater com ninguem.
+        Importa porque e' o que decide se o /ops pode funcionar. A doc do BDS
+        e' explicita: o permissions.json "needs online-mode to be enabled since
+        xuid requires online verification of the user account". Sem
+        autenticacao o cliente nao tem XUID, e a lista de permissao - que casa
+        por XUID - nao tem como casar com ninguem.
         """
         return self.le_props().get("online-mode", "true").strip().lower() == "true"
 
-    def corrige_xuid(self, nome: str) -> bool:
-        """Tira o XUID de uma entrada para o servidor resolver de novo.
-
-        Entrada com xuid e' definitiva demais: a doc diz que o campo ausente
-        "will be populated when someone with a matching name connects", ou
-        seja, o nome sozinho ja e caminho valido e e o unico que funciona sem
-        autenticacao Microsoft. O sintoma de um xuid errado e o pior possivel
-        - "voce nao esta na allow-list" de quem esta na lista, sem pista de
-        porque.
-
-        Devolve True se a entrada existia com XUID e ele foi removido.
-        """
-        dados = self.allowlist()
-        alvo = nome.lower()
-        mudou = False
-        for item in dados:
-            if str(item.get("name", "")).lower() != alvo:
-                continue
-            if item.pop("xuid", None):
-                mudou = True
-        if mudou:
-            self._salva_lista(self.allowlist_path, dados)
-        return mudou
-
-    def purga_xuids(self) -> list[str]:
-        """Tira o xuid de toda a lista. Devolve os nomes que mudaram.
-
-        E' a cura de quem roda com online-mode=false: entrada com xuid nao
-        trava so quem entra pela ultima vez, ela trava o dono da lista tambem,
-        porque a lista so e reescrita com o nome quando alguem entra. Chamar
-        isso no boot garante que um arquivo herdado de quando o servidor
-        exigia conta nao vire um no-op eterno.
-        """
-        dados = self.allowlist()
-        mudados: list[str] = []
-        for item in dados:
-            nome = str(item.get("name", ""))
-            if item.pop("xuid", None) and nome:
-                mudados.append(nome)
-        if mudados:
-            self._salva_lista(self.allowlist_path, dados)
-        return mudados
-
-    def entradas_com_xuid(self) -> list[str]:
-        """Nomes da lista que ainda carregam xuid (o que trava em modo offline)."""
-        return [str(i.get("name", "")) for i in self.allowlist() if i.get("xuid")]
-
     def permissoes(self) -> list[dict]:
         return self._lista(self.permissions_path)
-
-    def add_allowlist(self, nome: str, xuid: str | None = None, log_txt: str | None = None) -> bool:
-        """True se entrou como novo.
-
-        Caminho de reserva: o jeito normal de liberar alguem e o console
-        ('allowlist add'), porque o BDS resolve o XUID sozinho e salva a lista
-        no formato dele. Isto aqui so serve quando o console nao responde
-        (Docker Desktop), e ai o arquivo precisa mudar na mao.
-
-        O XUID e' opcional de proposito, nao por preguiça: a doc do BDS diz que
-        "if it's not set then it will be populated when someone with a matching
-        name connects". Exigir o numero aqui barraria exatamente quem nunca
-        conseguiu entrar, que e quem precisa da permissao - e o XUID adivinhado
-        no log, quando errado, e pior do que nenhum: o BDS valida a entrada por
-        ele.
-
-        Sem autenticacao Microsoft o XUID nem existe, e por isso o `log_txt`
-        so entra no arquivo quando `online-mode` esta ligado. Gravar o numero
-        com o servidor em modo offline nao e perder a entrada: e gravar uma
-        entrada que o servidor nao vai conseguir casar com ninguem.
-
-        Um XUID que ja esta na entrada nunca e trocado. Quem preenche a lista e
-        o proprio BDS, nao a gente; se o numero informado divergir do que o
-        servidor gravou, um dos dois esta errado, e o servidor ganha a duvida.
-        """
-        dados = self.allowlist()
-        alvo = nome.lower()
-        if not self.online_mode():
-            # Nem procura no log nem guarda: sem autenticacao o numero viria
-            # de uma conta que o servidor nunca vai ver.
-            xuid = None
-        elif xuid is None and log_txt is not None:
-            xuid = self.xuid_no_log(nome, log_txt)
-
-        for item in dados:
-            nome_atual = str(item.get("name", "")).lower()
-            xuid_atual = str(item.get("xuid", ""))
-            if nome_atual == alvo or (xuid and xuid_atual == xuid):
-                if xuid and not xuid_atual:
-                    item["xuid"] = str(xuid)
-                if not item.get("name"):
-                    item["name"] = nome
-                self._salva_lista(self.allowlist_path, dados)
-                return False
-
-        # o BDS escreve as tres chaves, nessa ordem, e preenche o xuid depois.
-        # Gravar so name deixaria um arquivo que nao parece com o que o
-        # servidor escreve de volta.
-        entrada: dict[str, object] = {"ignoresPlayerLimit": False, "name": nome}
-        if xuid:
-            entrada["xuid"] = str(xuid)
-        dados.append(entrada)
-        self._salva_lista(self.allowlist_path, dados)
-        return True
-
-    def remove_allowlist(self, nome: str) -> bool:
-        dados = self.allowlist()
-        alvo = nome.lower()
-        novo = [i for i in dados if str(i.get("name", "")).lower() != alvo]
-        if len(novo) == len(dados):
-            return False
-        self._salva_lista(self.allowlist_path, novo)
-        return True
 
     def set_permissao(self, nome: str, xuid: str, nivel: str) -> bool:
         if nivel not in ("visitor", "member", "operator"):
@@ -535,9 +381,7 @@ class ServerControl:
         """Acha o XUID do jogador no log do BDS (ele imprime quando o cara entra).
 
         Serve para o /ops, que escreve no permissions.json - la o XUID e
-        obrigatorio mesmo. Para a allow-list nao: o BDS resolve o proprio na
-        primeira conexao, e um numero adivinhado errado trava o jogador em vez
-        de liberar.
+        obrigatorio mesmo, porque a lista casa por ele.
         """
         alvo = nome.lower()
         for linha in reversed(log_txt.splitlines()):
@@ -546,3 +390,35 @@ class ServerControl:
                 if achado:
                     return achado.group(0)
         return None
+
+
+def parse_player_connected(linha: str) -> tuple[str, str] | None:
+    """Extrai (nome, xuid) de uma linha do log do servidor do tipo
+    `Player connected: Ze Do Zero/2535453759792258`.
+    """
+    if not linha:
+        return None
+    match = PLAYER_CONNECTED_RE.search(linha)
+    if not match:
+        return None
+    nome = match.group("nome").strip()
+    xuid = match.group("xuid").strip()
+    if not nome or not xuid:
+        return None
+    return nome, xuid
+
+
+def jogadores_conectados(log_txt: str) -> list[tuple[str, str]]:
+    """Retorna eventos de entrada no log sem duplicar nomes diferentes."""
+    vistos: set[tuple[str, str]] = set()
+    ordem: list[tuple[str, str]] = []
+    for linha in log_txt.splitlines():
+        evento = parse_player_connected(linha)
+        if evento is None:
+            continue
+        chave = (evento[0].casefold(), evento[1])
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        ordem.append(evento)
+    return ordem

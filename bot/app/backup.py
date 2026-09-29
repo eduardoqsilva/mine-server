@@ -1,10 +1,14 @@
 """Backup do mundo, da config e da memoria do bot.
 
 Duas camadas porque elas valem coisas diferentes. O /data e o que o BDS le:
-mundo, server.properties, allowlist, permissions e os packs que o admin
-instalou. O /state/bot.db e o que o bot sabe: quem e admin, o hash das chaves
-de acesso, os overrides do /config e a auditoria. Perder o primeiro tira o
-servidor; perder o segundo obriga a reemitir toda chave de acesso.
+mundo, server.properties, permissions e os packs que o admin instalou. O
+/state/bot.db e o que o bot sabe: quem e admin, o hash das chaves de acesso,
+os overrides do /config e a auditoria. Perder o primeiro tira o servidor;
+perder o segundo obriga a reemitir toda chave de acesso.
+
+O allowlist.json continua na lista mesmo sem lista no bot: e' o BDS que escreve
+esse arquivo, e um dia alguem pode ligar a allow-list na mao. Um backup que
+fosse se bipartir por causa disso seria um backup pior.
 
 O que fica de fora, de proposito:
 

@@ -10,6 +10,7 @@ import io
 import json
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import zipfile
@@ -483,7 +484,7 @@ def test_raknet() -> None:
 
 
 def test_store() -> None:
-    print("store: usuarios, chaves, overrides, negados")
+    print("store: usuarios, chaves, overrides")
     tmp = Path(tempfile.mkdtemp())
     try:
         st = store.Store(tmp / "bot.db")
@@ -532,15 +533,62 @@ def test_store() -> None:
         st.limpa_override("max-players")
         check("override removido", "max-players" not in st.overrides())
 
-        st.nega("JogadorRuim", "grief", 2)
-        check("negado registrado", st.esta_negado("jogadorruim"), st.negados())
-        st.permite("JogadorRuim")
-        check("negado liberado", not st.esta_negado("jogadorruim"))
-
         st.audita(2, "config", "difficulty=hard")
         reg = st.auditoria(5)
         check("auditoria gravada", bool(reg) and reg[0]["action"] == "config", reg)
         st.fecha()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_store_migracao_allowlist() -> None:
+    """O .db de quem rodou a versao com allow-list tem que ficar limpo.
+
+    A limpeza importa mais do que parece: o reconciliador reaplica override a
+    cada 60s, entao um 'allow-list=true' sobrevivendo no .db reescreveria a
+    propriedade no server.properties para sempre, mesmo com a chave fora do
+    catalogo. E o servidor ficaria fechado sem ninguem ter mandado nada.
+    """
+    print("\nstore: migracao tira a allow-list antiga")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        caminho = tmp / "bot.db"
+        # monta um .db no formato antigo
+        velho = sqlite3.connect(caminho)
+        velho.executescript(
+            """
+            CREATE TABLE overrides (k TEXT PRIMARY KEY, v TEXT NOT NULL,
+                                    updated_by INTEGER, updated_at REAL NOT NULL);
+            CREATE TABLE denied (name TEXT PRIMARY KEY COLLATE NOCASE, reason TEXT,
+                                 by INTEGER, at REAL NOT NULL);
+            CREATE TABLE liberacao (name TEXT PRIMARY KEY COLLATE NOCASE, by INTEGER,
+                                    at REAL NOT NULL);
+            INSERT INTO overrides VALUES ('allow-list', 'true', 1, 0);
+            INSERT INTO overrides VALUES ('difficulty', 'hard', 1, 0);
+            INSERT INTO denied VALUES ('JogadorRuim', 'grief', 1, 0);
+            INSERT INTO liberacao VALUES ('Esperando', 1, 0);
+            """
+        )
+        velho.commit()
+        velho.close()
+
+        st = store.Store(caminho)
+        tabelas = {
+            linha[0]
+            for linha in sqlite3.connect(caminho).execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        check("tabela de negados apagada", "denied" not in tabelas, sorted(tabelas))
+        check("tabela de liberacao apagada", "liberacao" not in tabelas, sorted(tabelas))
+        check("override de allow-list apagado", "allow-list" not in st.overrides(), st.overrides())
+        check("os outros overrides ficaram", st.overrides() == {"difficulty": "hard"}, st.overrides())
+
+        # e rodar de novo nao estraga nada
+        st2 = store.Store(caminho)
+        check("migracao e idempotente", st2.overrides() == {"difficulty": "hard"}, st2.overrides())
+        st.fecha()
+        st2.fecha()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -621,7 +669,7 @@ def test_auth() -> None:
 
 
 def test_serverctl() -> None:
-    print("serverctl: server.properties, allowlist, permissions")
+    print("serverctl: server.properties e permissions")
     tmp = Path(tempfile.mkdtemp())
     try:
         data = tmp / "data"
@@ -629,7 +677,6 @@ def test_serverctl() -> None:
         (data / "server.properties").write_text(
             "server-name=Revolucao\ngamemode=survival\ndifficulty=easy\n#comentario\n\n", encoding="utf-8"
         )
-        (data / "allowlist.json").write_text(json.dumps([{"name": "Ze", "xuid": "2535453759792258"}]), encoding="utf-8")
         (data / "permissions.json").write_text(json.dumps([{"player": "Ze", "xuid": "2535453759792258", "permission": "member"}]), encoding="utf-8")
         srv = serverctl.ServerControl(data, backup_keep=2)
 
@@ -657,7 +704,7 @@ def test_serverctl() -> None:
             check("dificuldade invalida barrada", False)
         except serverctl.PropertyError:
             check("dificuldade invalida barrada", True)
-        check("boolAceita sim", serverctl.valida(serverctl.POR_CHAVE["allow-list"], "sim") == "true")
+        check("bool aceita sim", serverctl.valida(serverctl.POR_CHAVE["allow-cheats"], "sim") == "true")
         try:
             serverctl.valida(serverctl.POR_CHAVE["max-players"], "muitos")
             check("numero invalido barrado", False)
@@ -710,46 +757,18 @@ def test_serverctl() -> None:
             udp.cuidado,
         )
 
-        # allow-list tem comando de console; o resto do catalogo nao tem
-        check("allow-list liga ao vivo", serverctl.comando_ao_vivo("allow-list", "true") == "allowlist on")
-        check("allow-list desliga ao vivo", serverctl.comando_ao_vivo("allow-list", "false") == "allowlist off")
-        check("difficulty nao tem comando ao vivo", serverctl.comando_ao_vivo("difficulty", "hard") == "")
+        # A allow-list saiu do catalogo de proposito: o servidor e' aberto e
+        # ninguem liga a lista por acidente. Quem quiser trancar a porta liga
+        # ALLOW_LIST=true no .env ou manda /console allowlist on na mao - e o
+        # /status avisa que ela esta ligada.
+        check("allow-list nao esta no catalogo", "allow-list" not in serverctl.POR_CHAVE)
+        check("allow-list nao e do compose", not serverctl.do_compose("allow-list"))
 
-        # gamertag com espaco precisa de aspas no console, senao o BDS le duas
-        # palavras e nunca acha o jogador
-        check("nome sem espaco nao leva aspas", serverctl.cita("ExampleName") == "ExampleName")
-        check("nome com espaco vai entre aspas", serverctl.cita("Example Name") == '"Example Name"')
         check("valor aceito pelo valida", serverctl.valida(udp, "157.151.1.224:19133-19172:19133-19172")
               == "157.151.1.224:19133-19172:19133-19172")
 
         srv.set_prop("level-name", "Mundo Novo")
         check("nome do mundo com espaco", srv.nivel_do_mundo("world") == "Mundo Novo", srv.nivel_do_mundo("world"))
-
-        novo = srv.add_allowlist("Ana")
-        check("jogador adicionado", novo and srv.allowlist()[-1]["name"] == "Ana", srv.allowlist())
-        check("chamada repetida nao duplica", srv.add_allowlist("Ana") is False)
-        check("xuid preservado dos outros", srv.allowlist()[0]["xuid"] == "2535453759792258", srv.allowlist())
-
-        log = "[2026] Player connected: Bia/1234567890123456"
-        check(
-            "xuid do log preenche allowlist por nick",
-            srv.add_allowlist("Bia", log_txt=log) and srv.allowlist()[-1]["xuid"] == "1234567890123456",
-            srv.allowlist(),
-        )
-        check(
-            "entrada existente sem xuid ganha xuid",
-            srv.add_allowlist("Ana", log_txt="[2026] Player connected: Ana/9999999999999999") is False,
-            srv.allowlist(),
-        )
-        # quem preenche a lista e o BDS. Se o xuid informado diverge do que o
-        # servidor ja gravou, um dos dois esta errado - e o servidor ganha a
-        # duvida. Sobrescrever aqui ja quebrou gente no passado.
-        srv.add_allowlist("Ana", "1111111111111111")
-        check("xuid divergente nao sobrescreve", srv.allowlist()[1]["xuid"] == "9999999999999999", srv.allowlist())
-
-        check("remocao funciona", srv.remove_allowlist("Ana") and srv.remove_allowlist("Bia") and len(srv.allowlist()) == 1)
-        check("remover ausente nao quebra", srv.remove_allowlist("Fantasma") is False)
-        check("allowlist continua json valido", json.loads((data / "allowlist.json").read_text(encoding="utf-8"))[0]["name"] == "Ze")
 
         srv.set_permissao("Ana", "1234567890123456", "operator")
         check("permissao gravada", srv.permissoes()[-1]["permission"] == "operator", srv.permissoes())
@@ -766,19 +785,19 @@ def test_serverctl() -> None:
         log = "[2026] Player connected: Ze/2535453759792258"
         check("xuid encontrado no log", srv.xuid_no_log("Ze", log) == "2535453759792258")
         check("xuid ausente vira None", srv.xuid_no_log("Ninguem", log) is None)
+        check(
+            "evento de conexao parseado",
+            serverctl.parse_player_connected("[Server] Player connected: Ze Do Zero/2535453759792258")
+            == ("Ze Do Zero", "2535453759792258"),
+        )
+        check("evento sem xuid volta None", serverctl.parse_player_connected("[Server] Player connected: Ze") is None)
 
-        # O BDS escreve as tres chaves e preenche o xuid depois. Se a gente
-        # grava so name, o arquivo nao parece com o que o servidor escreve de
-        # volta - e e assim que a edicao na mao do allowlist.json foi perdida.
-        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
-        srv.add_allowlist("Bia")
-        entrada = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))[0]
-        check("entrada nova tem as tres chaves do BDS", list(entrada) == ["ignoresPlayerLimit", "name"], entrada)
-        check("ignoresPlayerLimit falso", entrada["ignoresPlayerLimit"] is False, entrada)
-        check("entrada sem xuid nao inventa numero", "xuid" not in entrada, entrada)
-        # sem xuid a entrada ainda e valida: e assim que a doc do BDS descreve
-        # (o xuid e preenchido quando o jogador entra)
-        check("nome sozinho e jogo valido", json.loads((data / "allowlist.json").read_text(encoding="utf-8"))[0]["name"] == "Bia")
+        # online-mode decide se o /ops pode funcionar: o permissions.json casa
+        # por xuid, e xuid so existe com autenticacao online.
+        srv.set_prop("online-mode", "false")
+        check("online_mode le desligado", srv.online_mode() is False, srv.le_props())
+        (data / "server.properties").write_text("server-name=Revolucao\n", encoding="utf-8")
+        check("sem a chave, vale o padrao do BDS (true)", srv.online_mode() is True, srv.le_props())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -795,9 +814,9 @@ def test_interpreta_config() -> None:
     check("sim confirma", inter(["max-players", "30", "sim"]) == ("max-players", "30", True))
     check("sim em caixa alta confirma", inter(["max-players", "30", "SIM"]) == ("max-players", "30", True))
     check("confirmacao nao some do texto", inter(["server-name", "Meu", "Server", "Legal", "sim"]) == ("server-name", "Meu Server Legal", True))
-    check("sim sozinho e valor, nao confirmacao", inter(["allow-list", "sim"]) == ("allow-list", "sim", False))
+    check("sim sozinho e valor, nao confirmacao", inter(["allow-cheats", "sim"]) == ("allow-cheats", "sim", False))
     check("3 palavras com sim no fim e confirmacao", inter(["server-name", "para", "sim"]) == ("server-name", "para", True))
-    check("sim e valor de verdade", serverctl.valida(serverctl.POR_CHAVE["allow-list"], "sim") == "true")
+    check("sim e valor de verdade", serverctl.valida(serverctl.POR_CHAVE["allow-cheats"], "sim") == "true")
 
     perigosa = serverctl.POR_CHAVE["max-players"]
     check("perigosa pede confirmacao", conf(perigosa, False))
@@ -811,32 +830,19 @@ def test_interpreta_config() -> None:
 
 
 def test_nome_do_gamertag() -> None:
-    """Como o gamertag sobrevive a '/permitir <nome> [xuid]'.
+    """Como o gamertag sobrevive ao /ops e ao /chutar.
 
-    Gamertag com espaco tem que chegar inteiro no BDS, e a doc oficial exige
-    aspas. O lado perigoso do parser e' o outro: liberar 'Ze' quando o jogador
-    se chama 'Ze Do Zero' nao da erro nenhum, o bot so vai descobrir que nao
-    funcionou quando o jogador tentar entrar de novo. Por isso sobra de
-    argumento vira aviso, nao nome silenciosamente cortado.
+    Gamertag com espaco tem que chegar inteiro, e a doc oficial exige aspas. O
+    lado perigoso do parser e' o outro: mexer em 'Ze' quando o jogador se chama
+    'Ze Do Zero' nao da erro nenhum, so aparece quando ele tenta entrar. Por
+    isso o resto do argumento e' devolve inteiro, nunca cortado em silencio.
     """
-    print("\ngamertag: nome, aspas e xuid opcional")
-    nome, xuid, sobra = admin._nome_e_xuid("Ze")
-    check("gamertag simples", (nome, xuid, sobra) == ("Ze", None, ""), (nome, xuid, sobra))
-    nome, xuid, sobra = admin._nome_e_xuid('"Ze Do Zero"')
-    check("gamertag com espaco entre aspas", (nome, xuid, sobra) == ("Ze Do Zero", None, ""), (nome, xuid, sobra))
-    nome, xuid, sobra = admin._nome_e_xuid("Ze 2535453759792258")
-    check("xuid opcional no fim", (nome, xuid, sobra) == ("Ze", "2535453759792258", ""), (nome, xuid, sobra))
-    nome, xuid, sobra = admin._nome_e_xuid('"Ze Do Zero" 2535453759792258')
-    check("aspas e xuid juntos", (nome, xuid) == ("Ze Do Zero", "2535453759792258"), (nome, xuid))
-    nome, xuid, sobra = admin._nome_e_xuid("Ze Do Zero")
-    check("sem aspas, sobra vira aviso", (nome, xuid, sobra) == ("Ze", None, "Do Zero"), (nome, xuid, sobra))
-    check("vazio nao quebra", admin._nome_e_xuid("") == ("", None, ""))
-    check("aspas quebrada nao vira aspa no nome", admin._nome_e_xuid('"Ze Do') == ("Ze", None, "Do"))
-    # o console recebe o mesmo nome, com aspas de novo
-    check("mesmo nome vai citado para o console", serverctl.cita("Ze Do Zero") == '"Ze Do Zero"')
-    # e os outros comandos usam a mesma quebra
-    check("negar quebra igual", admin._tokens('"Ze Do Zero" quebrando') == ["Ze Do Zero", "quebrando"])
-    check("chutar mantem o motivo inteiro", admin._tokens('"Ze Do Zero" quebrando o servidor')[-1] == "servidor")
+    print("\ngamertag: nome e aspas")
+    check("gamertag simples", admin._tokens("Ze") == ["Ze"], admin._tokens("Ze"))
+    check("gamertag com espaco entre aspas", admin._tokens('"Ze Do Zero"') == ["Ze Do Zero"])
+    check("aspas quebrada nao vira aspa no nome", admin._tokens('"Ze Do') == ["Ze", "Do"], admin._tokens('"Ze Do'))
+    check("motivo do chutar fica inteiro", admin._tokens('"Ze Do Zero" quebrando o servidor')[-1] == "servidor")
+    check("vazio nao quebra", admin._tokens("") == [])
 
 
 def test_config_persiste() -> None:
@@ -944,16 +950,15 @@ def test_config_persiste() -> None:
             [p.name for p in data.glob("server.properties.*.bak")],
         )
 
-        # allowlist/permissions tambem fazem backup, e tambem sao podados
-        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
+        # o permissions.json tambem faz backup, e tambem e podado
         for i in range(5):
-            srv.add_allowlist(f"Jogador{i}")
+            srv.set_permissao(f"Jogador{i}", str(1000000000000000 + i), "member")
         check(
-            "backup de allowlist tambem e podado",
-            len(list(data.glob("allowlist.json.*.bak"))) == 2,
-            [p.name for p in data.glob("allowlist.json.*.bak")],
+            "backup do permissions.json tambem e podado",
+            len(list(data.glob("permissions.json.*.bak"))) == 2,
+            [p.name for p in data.glob("permissions.json.*.bak")],
         )
-        check("allowlist continua valida", len(srv.allowlist()) == 5, srv.allowlist())
+        check("permissions.json continua valido", len(srv.permissoes()) == 5, srv.permissoes())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1090,504 +1095,6 @@ def test_console() -> None:
     check("sem sobreposicao nao inventa", docker_ctl._delta(["A", "B"], ["X", "Y"]) == [])
     check("log vazio antes devolve tudo", docker_ctl._delta([], ["A"]) == ["A"])
     check("nada novo devolve vazio", docker_ctl._delta(["A", "B"], ["A", "B"]) == [])
-
-
-def test_allowlist() -> None:
-    """O /permitir tem que liberar o jogador no BDS que esta rodando.
-
-    O caminho e' 'allowlist add' no console, e nao a edicao do
-    allowlist.json: o BDS reescreve esse arquivo quando desliga, a partir da
-    lista que tem em memoria, entao quem escreve no arquivo sem o servidor
-    saber tem a entrada apagada no proximo stop.
-    """
-    print("\nallowlist: liberar no console e conferir, com o arquivo como reserva")
-
-    class _Console:
-        """DockerController de mentira: responde o allowlist list como o BDS.
-
-        O codigo manda o comando inteiro numa string so
-        ("allowlist add \\"Example Name\\""), como o send-command espera, entao
-        o fake quebra em partes para saber o que responder.
-        """
-
-        def __init__(self, lista: list[str], recusa: str = "", rodando: bool = True) -> None:
-            self.lista = lista
-            self.recusa = recusa
-            self.rodando = rodando
-            self.comandos: list[str] = []
-
-        def state(self):
-            return SimpleNamespace(running=self.rodando, status="running" if self.rodando else "exited")
-
-        def console(self, *args: str, **kwargs) -> tuple[str, list[str]]:
-            bruto = args[0]
-            self.comandos.append(bruto)
-            if self.recusa:
-                return self.recusa, []
-            partes = bruto.split(maxsplit=2)
-            comando = partes[1] if len(partes) > 1 and partes[0] == "allowlist" else bruto
-            nome = partes[2].strip('"') if len(partes) > 2 else ""
-            if comando == "add":
-                if nome not in self.lista:
-                    self.lista.append(nome)
-                return "", []
-            if comando == "remove":
-                if nome in self.lista:
-                    self.lista.remove(nome)
-                return "", []
-            if comando == "list":
-                return "", list(self.lista)
-            return "", []
-
-    with tempfile.TemporaryDirectory() as tmp_al:
-        data = Path(tmp_al)
-        (data / "server.properties").write_text("allow-list=false\n", encoding="utf-8")
-        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
-        st = store.Store(data / "bot.db")
-        srv = serverctl.ServerControl(data)
-
-        class _Console:
-            """DockerController de mentira: responde o allowlist list como o BDS.
-
-            O codigo manda o comando inteiro numa string so
-            ("allowlist add \\"Example Name\\""), como o send-command espera, entao
-            o fake quebra em partes para saber o que responder.
-            """
-
-            def __init__(self, lista: list[str], recusa: str = "", rodando: bool = True) -> None:
-                self.lista = lista
-                self.recusa = recusa
-                self.rodando = rodando
-                self.comandos: list[str] = []
-                self.passos: list[str] = []
-
-            def state(self):
-                return SimpleNamespace(running=self.rodando, status="running" if self.rodando else "exited")
-
-            def say(self, texto: str) -> None:
-                self.passos.append("falou")
-
-            def para(self) -> None:
-                self.rodando = False
-                self.passos.append("parou")
-
-            def liga(self) -> None:
-                self.rodando = True
-                self.passos.append("subiu")
-
-            def console(self, *args: str, **kwargs) -> tuple[str, list[str]]:
-                bruto = args[0]
-                self.comandos.append(bruto)
-                if self.recusa:
-                    return self.recusa, []
-                partes = bruto.split(maxsplit=2)
-                comando = partes[1] if len(partes) > 1 and partes[0] == "allowlist" else bruto
-                nome = partes[2].strip('"') if len(partes) > 2 else ""
-                if comando == "add":
-                    if nome not in self.lista:
-                        self.lista.append(nome)
-                    return "", []
-                if comando == "remove":
-                    if nome in self.lista:
-                        self.lista.remove(nome)
-                    return "", []
-                if comando == "list":
-                    return "", list(self.lista)
-                return "", []
-
-        cfg = SimpleNamespace(
-            announce_seconds=0, boot_timeout=1, allowlist_grace_seconds=300, tz=timezone.utc
-        )
-        ctx = SimpleNamespace(
-            store=st, server=srv, config=cfg, docker=None,
-            em_restart=False, tarefa_liberacao=None, liberacao_em_curso=False,
-        )
-
-        # --- confirmar nome: nem string nem o chat podem mentir ---
-        # O bug antigo era procurar o nome com `in` em qualquer linha da janela
-        # de log. Um "Ze: ola" no chat confirmava a liberacao de um Ze que nao
-        # esta na lista - e o admin acreditava no bot.
-        check("nome exato conta", ops.confirmado(["Ze"], "Ze"))
-        check("nome com espaco e' a linha inteira", ops.confirmado(['"Ze Do Zero"'], "Ze Do Zero"))
-        check("lista com xuid conta", ops.confirmado(["Ze Do Zero (2535463291192118)"], "Ze Do Zero"))
-        check("prefixo de outro nao conta", not ops.confirmado(["Zezinho"], "Ze"))
-        check("chat com o nome nao conta", not ops.confirmado(["Ze: ola, tudo bem?"], "Ze"))
-        check("eco do comando nao conta", not ops.confirmado(['"Added Ze Do Zero"'], "Ze Do Zero"))
-        check("vazio nao confirma ninguem", not ops.confirmado([], "Ze"))
-
-        # --- console responde: o caminho bom ---
-        docker = _Console(["Ze"])
-        ctx.docker = docker
-        check("console de mentira pronto", docker.console("allowlist list")[1] == ["Ze"])
-
-        lib = asyncio.run(ops.poe_na_lista(ctx, "Example Name"))
-        check("entrou pela lista do servidor", lib.estado == ops.LIBERADO and lib.aviso == "", (lib.estado, lib.aviso))
-        check("add foi pelo console", 'allowlist add "Example Name"' in docker.comandos, docker.comandos)
-        check("confirmou com allowlist list", "allowlist list" in docker.comandos, docker.comandos)
-        check("mandou allowlist reload", "allowlist reload" in docker.comandos, docker.comandos)
-        depois_do_add = docker.comandos[docker.comandos.index('allowlist add "Example Name"') :]
-        check("reload veio antes do list", depois_do_add.index("allowlist reload") < depois_do_add.index("allowlist list"), depois_do_add)
-        check("nome com espaco foi entre aspas", "Example Name" in docker.lista, docker.lista)
-        check("arquivo nao foi tocado", json.loads((data / "allowlist.json").read_text(encoding="utf-8")) == [])
-
-        # o nome precisa aparecer de verdade na resposta: se nao aparecer, o
-        # bot nao pode dizer que liberou
-        class _Mudo(_Console):
-            def console(self, *args: str, **kwargs) -> tuple[str, list[str]]:
-                self.comandos.append(args[0])
-                return "", []
-
-        docker_mudo = _Mudo([])
-        ctx.docker = docker_mudo
-        lib = asyncio.run(ops.poe_na_lista(ctx, "Fantasma"))
-        check("sem confirmacao, nao diz que liberou", lib.estado == ops.LIBERADO_PENDENTE, lib.estado)
-        check("e diz que o console nao devolveu o nome", "nao devolveu o nome" in lib.aviso, lib.aviso)
-
-        # --- console recusado com o servidor RODANDO: so o reinicio salva ---
-        # O BDS reescreve o allowlist.json quando desliga, a partir da lista
-        # que ele tem em memoria. Se o console nao responde, a entrada no
-        # arquivo morre no proximo stop - e por isso que o /permitir agenda o
-        # reinicio em vez de mandar o admin reiniciar na mao.
-        recusa = "ERROR: failed to search for bedrock server process"
-        ctx.docker = _Console([], recusa=recusa, rodando=True)
-        lib = asyncio.run(ops.poe_na_lista(ctx, "Bia"))
-        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
-        check("fallback grava no arquivo no formato do BDS", {"ignoresPlayerLimit": False, "name": "Bia"} in salvos, salvos)
-        check("fallback fica pendente, nao liberado", lib.estado == ops.LIBERADO_PENDENTE, lib.estado)
-        check("fallback avisa que nao vale ainda", "nao vale" in lib.aviso, lib.aviso)
-        check("fallback diz o erro do console", "failed to search" in lib.aviso, lib.aviso)
-
-        # --- o console volta no meio: so o reload, sem derrubar o servidor ---
-        # Este e' o caso que a versao anterior tratava como "derruba o servidor
-        # em 5 minutos". A doc do BDS diz que o reload e' o que faz o servidor
-        # pasar a ler o arquivo, entao se ele responde o /permitir acaba aqui -
-        # e o timer deixa de ser o caminho normal.
-        class _RecusaNoAdd(_Console):
-            """O `add` falha (console mal), mas o reload e o list funcionam."""
-
-            def console(self, *args: str, **kwargs) -> tuple[str, list[str]]:
-                bruto = args[0]
-                self.comandos.append(bruto)
-                if bruto.startswith("allowlist add"):
-                    return recusa, []
-                if bruto == "allowlist reload":
-                    self.lista = [n for n in self.lista if n == "Ze"]
-                    self.lista.append("Caio")
-                    return "", []
-                partes = bruto.split(maxsplit=2)
-                comando = partes[1] if len(partes) > 1 and partes[0] == "allowlist" else bruto
-                if comando == "list":
-                    return "", list(self.lista)
-                return "", []
-
-        docker_meio = _RecusaNoAdd(["Ze"])
-        ctx.docker = docker_meio
-        lib = asyncio.run(ops.poe_na_lista(ctx, "Caio"))
-        check("reload sozinho libera, sem reiniciar", lib.estado == ops.LIBERADO, (lib.estado, lib.aviso))
-        check("e o aviso diz que foi sem reiniciar", "sem precisar reiniciar" in lib.aviso, lib.aviso)
-        check("nada foi agendado para reiniciar", st.liberacoes() == [], st.liberacoes())
-
-        # --- modo offline: a lista precisa ser so o nome ---
-        # Sem autenticacao Microsoft o cliente nao tem XUID, e a doc do BDS
-        # deixa o xuid opcional justamente por isso: "if it's not set then it
-        # will be populated when someone with a matching name connects". Com
-        # o campo preenchido, o servidor compara um numero que nunca bate e o
-        # jogador fica de fora mesmo estando na lista.
-        (data / "server.properties").write_text("allow-list=true\nonline-mode=false\n", encoding="utf-8")
-        check("online_mode le desligado", srv.online_mode() is False, srv.le_props())
-        (data / "server.properties").write_text("allow-list=true\n", encoding="utf-8")
-        check("sem a chave, vale o padrao do BDS (true)", srv.online_mode() is True, srv.le_props())
-        (data / "server.properties").write_text("allow-list=true\nonline-mode=false\n", encoding="utf-8")
-
-        (data / "allowlist.json").write_text(
-            json.dumps(
-                [
-                    {"ignoresPlayerLimit": False, "name": "Velha", "xuid": "2535463291192118"},
-                    {"ignoresPlayerLimit": False, "name": "Limpa"},
-                ]
-            ),
-            encoding="utf-8",
-        )
-        check("acha a entrada presa por xuid", srv.entradas_com_xuid() == ["Velha"], srv.entradas_com_xuid())
-
-        # O console nao confirma nada, entao o bot cai no arquivo - que e' o
-        # caminho onde o xuid poderia entrar por descuido.
-        ctx.docker = _Mudo([])
-        lib = asyncio.run(ops.poe_na_lista(ctx, "Novo"))
-        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
-        check("offline: entrada nova sem xuid", {"ignoresPlayerLimit": False, "name": "Novo"} in salvos, salvos)
-        check("offline: entrada nova tem o campo do BDS", "ignoresPlayerLimit" in next(e for e in salvos if e["name"] == "Novo"), salvos)
-        check("offline: e nao foi declarada liberada", lib.estado == ops.LIBERADO_PENDENTE, lib.estado)
-
-        # o /permitir com xuid digitado nao pode gravar o numero em modo offline
-        srv.add_allowlist("Digitado", xuid="2535463291192118")
-        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
-        entrada = next(e for e in salvos if e["name"] == "Digitado")
-        check("offline: xuid digitado e' ignorado", "xuid" not in entrada, entrada)
-
-        # online de volta: ai o xuid entra, porque existe. O numero e' outro de
-        # proposito - o add_allowlist deduplica por xuid, e repetir o mesmo
-        # casaria com a entrada da "Velha" em vez de criar uma nova.
-        (data / "server.properties").write_text("allow-list=true\nonline-mode=true\n", encoding="utf-8")
-        srv.add_allowlist("ComXbl", xuid="2535463291192119")
-        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
-        entrada = next(e for e in salvos if e["name"] == "ComXbl")
-        check("online: xuid e' gravado", entrada.get("xuid") == "2535463291192119", entrada)
-
-        # a cura do boot: tira o xuid de tudo quando o servidor nao autentica
-        (data / "server.properties").write_text("allow-list=true\nonline-mode=false\n", encoding="utf-8")
-        docker_cura = _Console([])
-        ctx.docker = docker_cura
-        curados = asyncio.run(ops.cura_offline(ctx))
-        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
-        check("cura tira o xuid de tudo", not any(e.get("xuid") for e in salvos), salvos)
-        check("cura devolve quem mudou", set(curados) >= {"Velha", "ComXbl"}, curados)
-        check("cura manda o reload", "allowlist reload" in docker_cura.comandos, docker_cura.comandos)
-        check("os nomes continuam na lista", {e["name"] for e in salvos} >= {"Velha", "Limpa", "Novo"}, salvos)
-
-        # online ligado: a cura nao existe e nao pode mexer na lista
-        (data / "server.properties").write_text("allow-list=true\nonline-mode=true\n", encoding="utf-8")
-        srv.add_allowlist("Intacta", xuid="2535463291192117")
-        check("online: cura nao age", asyncio.run(ops.cura_offline(ctx)) == [])
-        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
-        check("online: xuid continua", any(e.get("xuid") for e in salvos), salvos)
-        # purga_xuids e' a ferramenta crua, sem olhar o online-mode: quem decide
-        # e' cura_offline, que so chama ela com o servidor sem autenticacao.
-        check("purga_xuids tira o que sobrou", sorted(srv.purga_xuids()) == ["Intacta"], srv.allowlist())
-
-        # o /lista precisa apontar a entrada presa, senao o bug fica invisivel
-        (data / "server.properties").write_text("allow-list=true\nonline-mode=true\n", encoding="utf-8")
-        srv.add_allowlist("Presa", xuid="2535463291192116")
-        (data / "server.properties").write_text("allow-list=true\nonline-mode=false\n", encoding="utf-8")
-        ctx.docker = _Console(["Presa"])
-        estado = ops.estado_real(ctx)
-        check("estado_real sabe o online-mode", estado.online_mode is False, estado.online_mode)
-        check("e lista quem esta preso", estado.entradas_presas() == ["Presa"], estado.entradas_presas())
-        (data / "server.properties").write_text("allow-list=true\nonline-mode=true\n", encoding="utf-8")
-        estado = ops.estado_real(ctx)
-        check("online: ninguem e' preso", estado.entradas_presas() == [], estado.entradas_presas())
-        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
-
-        # Volta ao estado que o resto do bloco espera: lista desligada, e sem
-        # autenticacao, que e' como o compose entrega o servidor.
-        (data / "server.properties").write_text("allow-list=false\nonline-mode=false\n", encoding="utf-8")
-
-        # --- console recusado com o servidor PARADO: ai o boot resolve ---
-        ctx.docker = _Console([], recusa=recusa, rodando=False)
-        lib = asyncio.run(ops.poe_na_lista(ctx, "Caio"))
-        check("servidor parado: o boot le o arquivo", lib.estado == ops.LIBERADO_BOOT, lib.estado)
-        check("e diz o motivo do console", "failed to search" in lib.aviso, lib.aviso)
-
-        # remover tambem passa pelo console quando ele existe
-        docker_ok = _Console(["Bia", "Ze"])
-        ctx.docker = docker_ok
-        saiu, aviso = asyncio.run(ops.tira_da_lista(ctx, "Bia"))
-        check("removeu pelo console", saiu and aviso == "" and docker_ok.lista == ["Ze"], (saiu, aviso, docker_ok.lista))
-
-        # --- ligar a lista: propriedade e runtime, os dois ---
-        check("comeca desligada", srv.le_props()["allow-list"] == "false", srv.le_props())
-        aviso = asyncio.run(ops.liga_a_lista(ctx, 42))
-        check("mandou allowlist on", "allowlist on" in docker_ok.comandos, docker_ok.comandos)
-        check("graveu allow-list=true no arquivo", srv.le_props()["allow-list"] == "true", srv.le_props())
-        check("guardou o override", st.overrides().get("allow-list") == "true", st.overrides())
-        check("avisa que ligou agora", "ja vem ligada" in aviso, aviso)
-
-        # Ja true no arquivo: o 'allowlist on' continua sendo enviado. O BDS
-        # reescreve allow-list no shutdown a partir do runtime, e ele pode ter
-        # virado false num boot em que o arquivo ainda era false - confiar so
-        # no arquivo era o jeito de o bot achar que a lista estava no ar sem
-        # ela estar.
-        docker_ok2 = _Console([])
-        ctx.docker = docker_ok2
-        aviso = asyncio.run(ops.liga_a_lista(ctx, 42))
-        check("arquivo true ainda manda allowlist on", docker_ok2.comandos == ["allowlist on"], docker_ok2.comandos)
-        check("e nao repete a escrita", aviso == "", aviso)
-
-        # --- estado_real: as tres fontes lado a lado ---
-        # Um nome no arquivo que o servidor nao tem e' o bug escrito na tela.
-        (data / "allowlist.json").write_text(
-            json.dumps([{"name": "Bia", "xuid": "1"}, {"name": "SoNoArquivo"}]), encoding="utf-8"
-        )
-        (data / "whitelist.json").write_text("[]\n", encoding="utf-8")
-        ctx.docker = _Console(["Bia"])
-        estado = ops.estado_real(ctx)
-        check("estado_real le o console", estado.linhas_servidor == ["Bia"], estado.linhas_servidor)
-        check("acha quem so esta no arquivo", estado.so_no_arquivo() == ["SoNoArquivo"], estado.so_no_arquivo())
-        check("e ve o whitelist.json", estado.whitelist_antigo is True, estado.whitelist_antigo)
-        (data / "whitelist.json").unlink()
-
-        # console fora do ar: sem ele o bot nao afirma divergencia nenhuma
-        ctx.docker = _Console([], recusa=recusa)
-        estado = ops.estado_real(ctx)
-        check("sem console, nao inventa divergencia", estado.so_no_arquivo() == [], estado.so_no_arquivo())
-        check("mas guarda o erro", "failed to search" in estado.erro_console, estado.erro_console)
-
-        # --- o reinicio que faz a liberacao valer ---
-        # A ordem e' o mecanismo: para, escreve, sobe. Escrever antes do stop
-        # seria o jeito certo de perder a entrada, porque o BDS reescreve o
-        # arquivo no shutdown.
-        srv.add_allowlist("Bia")
-        srv.add_allowlist("Caio")
-        st.limpa_liberacoes()
-        st.marca_liberacao("Bia", 42)
-        st.marca_liberacao("Caio", 42)
-
-        original_espera = ops.espera_pronto
-
-        async def espera_falsa(ctx):
-            return True, "", SimpleNamespace(jogadores=0)
-
-        ops.espera_pronto = espera_falsa
-        try:
-            docker_seq = _Console(["Bia", "Caio"], recusa=recusa, rodando=True)
-            ctx.docker = docker_seq
-            escrever = srv.add_allowlist
-
-            def add_rastreado(nome, xuid=None, log_txt=None):
-                docker_seq.passos.append(f"escreveu {nome}")
-                return escrever(nome, xuid, log_txt)
-
-            srv.add_allowlist = add_rastreado
-            try:
-                relatorio = asyncio.run(ops.libera_reiniciando(ctx, ["Bia", "Caio"], 42))
-            finally:
-                srv.add_allowlist = escrever
-            check("parou antes de escrever", docker_seq.passos.index("parou") < docker_seq.passos.index("escreveu Bia"), docker_seq.passos)
-            check("escreveu antes de subir", docker_seq.passos.index("escreveu Caio") < docker_seq.passos.index("subiu"), docker_seq.passos)
-            check("relatorio diz que entraram de verdade", "entrou na lista de verdade" in relatorio, relatorio)
-            check("nao sobrou pendencia", st.liberacoes() == [], st.liberacoes())
-            check("em_restart voltou a False", ctx.em_restart is False, ctx.em_restart)
-
-            # se o console voltar a listar todo mundo, o timer nao reinicia
-            docker_ja_tem = _Console(["Bia", "Caio"])
-            ctx.docker = docker_ja_tem
-            st.marca_liberacao("Bia", 42)
-            relatorio = asyncio.run(ops.dispara_pendente(ctx))
-            check("timer cancela se o servidor ja tem", "cancelei o reinicio" in relatorio, relatorio)
-            check("e nao derrubou o servidor", docker_ja_tem.passos == [], docker_ja_tem.passos)
-            check("e limpou a pendencia", st.liberacoes() == [], st.liberacoes())
-
-            # o botao antecipa: cancela o prazo e reinicia na hora
-            docker_botao = _Console([], recusa=recusa, rodando=True)
-            ctx.docker = docker_botao
-            st.marca_liberacao("Bia", 42)
-
-            class _TaskFalsa:
-                """So o que cancela_agenda olha: se terminou e o cancel()."""
-
-                def done(self) -> bool:
-                    return False
-
-                def cancel(self) -> None:
-                    self.cancelado = True
-
-            ctx.tarefa_liberacao = _TaskFalsa()
-            check("botao corta o prazo", ops.cancela_agenda(ctx) is True)
-            relatorio = asyncio.run(ops.dispara_pendente(ctx))
-            check("botao reinicia de uma vez", "parou" in docker_botao.passos, docker_botao.passos)
-            check("e o relatorio e' o da liberacao", "entrou na lista de verdade" in relatorio, relatorio)
-
-            # o timer sozinho: e' a promessa que o /permitir faz, entao ela
-            # precisa valer mesmo sem ninguem apertar botao
-            docker_timer = _Console([], recusa=recusa, rodando=True)
-            ctx.docker = docker_timer
-            ctx.tarefa_liberacao = None
-            st.limpa_liberacoes()
-            cfg.allowlist_grace_seconds = 1
-            avisados = []
-
-            class _Bot:
-                async def send_message(self, chat_id, texto):
-                    avisados.append((chat_id, texto))
-
-            st.define_admin(777, "dono")
-
-            async def espera_o_timer():
-                await ops.agenda_liberacao(ctx, ["Sem Botao"], 42, _Bot())
-                await ctx.tarefa_liberacao
-
-            asyncio.run(espera_o_timer())
-            check("o timer reiniciou sozinho", "parou" in docker_timer.passos, docker_timer.passos)
-            check("e avisou o admin", any("Sem Botao" in t for _c, t in avisados), avisados)
-            check("a task se limpou sozinha", ctx.tarefa_liberacao is None, ctx.tarefa_liberacao)
-            cfg.allowlist_grace_seconds = 300
-        finally:
-            ops.espera_pronto = original_espera
-
-        # --- o prazo ---
-        # Tudo num unico asyncio.run: a task do prazo e' criada dentro do loop
-        # que a roda, e um asyncio.run que devolve ja cancela e fecha o loop
-        # dela. Espalhar isso em varios asyncio.run mediria o asyncio, e nao o
-        # prazo.
-        st.limpa_liberacoes()
-
-        class _Bot2(_Bot):
-            pass
-
-        async def cenario_prazo() -> None:
-            cfg.allowlist_grace_seconds = 0
-            aviso = await ops.agenda_liberacao(ctx, ["Bia"], 42, _Bot2())
-            check("prazo 0 nao promete reinicio", "So pelo botao" in aviso, aviso)
-            check("mas a pendencia fica marcada", [r["name"] for r in st.liberacoes()] == ["Bia"], st.liberacoes())
-            check("e nenhuma task foi criada", ctx.tarefa_liberacao is None, ctx.tarefa_liberacao)
-
-            cfg.allowlist_grace_seconds = 300
-            aviso = await ops.agenda_liberacao(ctx, ["Caio"], 42, _Bot2())
-            check("o prazo e' informado", "5 min" in aviso and "reinicio assim mesmo" in aviso, aviso)
-            check("task de espera criada", ctx.tarefa_liberacao is not None)
-            # o prazo corre da primeira marcacao, e nao da ultima: e o que faz
-            # a hora mostrada na tela ser a mesma que o timer vai cumprir
-            check("o prazo comeca agora", 299 <= ops.restante(ctx) <= 300, ops.restante(ctx))
-            await asyncio.sleep(1.1)
-            aviso = await ops.agenda_liberacao(ctx, ["Bia"], 42, _Bot2())
-            check("segundo /permitir nao estica o prazo", "Ja esta marcado" in aviso, aviso)
-            check("e o relogio continua andando", 297 <= ops.restante(ctx) <= 299, ops.restante(ctx))
-            check(
-                "as duas pendencias estao marcadas",
-                sorted(r["name"] for r in st.liberacoes()) == ["Bia", "Caio"],
-                st.liberacoes(),
-            )
-            check("botao cancela o prazo de verdade", ops.cancela_agenda(ctx) is True)
-            await asyncio.sleep(0.01)
-            # cancel() em task que nem chegou a rodar a primeira vez joga o
-            # CancelledError no inicio do corpo, antes do try: a tarefa morre e
-            # o finally nem roda. O que importa e' que ela nao volte a contar.
-            check(
-                "a task cancelada morre",
-                ctx.tarefa_liberacao is None or ctx.tarefa_liberacao.done(),
-                ctx.tarefa_liberacao,
-            )
-            st.limpa_liberacoes()
-
-        asyncio.run(cenario_prazo())
-
-        # --- sobreviver a um restart do bot ---
-        # A task morre com o container, mas a promessa esta no bot.db: o boot
-        # seguinte rearma o prazo que faltava, em vez de sumir com ele.
-        async def cenario_rearme() -> bool:
-            st.marca_liberacao("Bia", 42)
-            ops.rearma_pendencia(ctx, _Bot2())
-            armado = ctx.tarefa_liberacao is not None
-            ops.cancela_agenda(ctx)
-            await asyncio.sleep(0.01)
-            st.limpa_liberacoes()
-            return armado
-
-        check("rearmou depois do boot", asyncio.run(cenario_rearme()))
-
-        async def cenario_prazo_zero() -> bool:
-            cfg.allowlist_grace_seconds = 0
-            st.marca_liberacao("Bia", 42)
-            antes = ctx.tarefa_liberacao
-            ops.rearma_pendencia(ctx, _Bot2())
-            cfg.allowlist_grace_seconds = 300
-            nada = ctx.tarefa_liberacao is antes
-            st.limpa_liberacoes()
-            return nada
-
-        check("prazo 0 nao rearma nada", asyncio.run(cenario_prazo_zero()))
-
-        st.fecha()
 
 
 def test_dropbox() -> None:
@@ -2124,13 +1631,13 @@ if __name__ == "__main__":
         test_apply_update,
         test_raknet,
         test_store,
+        test_store_migracao_allowlist,
         test_auth,
         test_serverctl,
         test_interpreta_config,
         test_nome_do_gamertag,
         test_config_persiste,
         test_console,
-        test_allowlist,
         test_dropbox,
         test_backup,
         test_ops_backup,
