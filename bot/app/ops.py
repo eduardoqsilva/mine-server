@@ -52,9 +52,19 @@ class AppContext:
 
 
 def overrides_sujo(ctx: AppContext) -> list[tuple[str, str, str]]:
-    """Overrides do banco que o server.properties nao tem mais (drift)."""
+    """Overrides do banco que o server.properties nao tem mais (drift).
+
+    As chaves do compose ficam de fora: a imagem reescreve level-name e
+    server-udp-ports em todo boot a partir do .env, entao reaplicar o override
+    aqui so faria o reconciliador e o compose discordarem a cada 60s, com o BDS
+    lendo o valor do compose no boot seguinte de qualquer jeito.
+    """
     atual = ctx.server.le_props()
-    return [(k, v, atual.get(k, "")) for k, v in ctx.store.overrides().items() if atual.get(k) != v]
+    return [
+        (k, v, atual.get(k, ""))
+        for k, v in ctx.store.overrides().items()
+        if atual.get(k) != v and not serverctl.do_compose(k)
+    ]
 
 
 def aplica_overrides(ctx: AppContext) -> list[str]:
@@ -91,6 +101,19 @@ def limpa_linha_console(linha: str) -> str:
     return texto
 
 
+def limpa_resposta(comando: str, linhas: list[str]) -> list[str]:
+    """As linhas da resposta sem carimbo, sem tag de parede e sem eco do comando."""
+    corpo: list[str] = []
+    for bruta in linhas:
+        limpa = limpa_linha_console(bruta)
+        if not limpa or limpa.lower() == comando.lower():
+            continue
+        if corpo and limpa == corpo[-1]:
+            continue
+        corpo.append(limpa)
+    return corpo
+
+
 def resposta_console(comando: str, linhas: list[str], erro: str = "", limite: int = 3500) -> str:
     """Monta a resposta do console para o Telegram.
 
@@ -101,14 +124,7 @@ def resposta_console(comando: str, linhas: list[str], erro: str = "", limite: in
     if erro:
         return "\n".join([cabecalho, "", txt.erro("O comando nao chegou no console."), "", txt.sub([erro])])
 
-    corpo: list[str] = []
-    for bruta in linhas:
-        limpa = limpa_linha_console(bruta)
-        if not limpa or limpa.lower() == comando.lower():
-            continue
-        if corpo and limpa == corpo[-1]:
-            continue
-        corpo.append(limpa)
+    corpo = limpa_resposta(comando, linhas)
 
     if not corpo:
         return "\n".join(
@@ -129,6 +145,115 @@ def resposta_console(comando: str, linhas: list[str], erro: str = "", limite: in
     if len(texto) > limite:
         texto = "... (inicio cortado)\n" + texto[-(limite - 24) :]
     return f"{cabecalho}\n\n{texto}"
+
+
+# --------------------------------------------------------------- allow-list
+
+# O console e a fonte da verdade da allow-list, e o arquivo e o reserva. Isso
+# nao e preciosismo: o BDS reescreve allowlist.json quando desliga, a partir da
+# lista que tem em memoria. Quem escreve no arquivo sem o servidor saber
+# (allowlist reload recusado, comando nunca entregue) tem a entrada apagada no
+# proximo stop - que e o "adicionei a pessoa e ela sumiu da lista depois de um
+# restart".
+def allowlist_no_console(ctx: AppContext, *args: str) -> tuple[str, list[str]]:
+    """Manda 'allowlist ...' no console do BDS.
+
+    Devolve (erro, linhas limpas). Erro vazio = o comando chegou no servidor.
+    As respostas que interessam sao 'list' (o que ele tem carregado) e 'add' /
+    'remove'; 'on', 'off' e 'reload' sao silenciosos, como o /console avisa.
+    """
+    comando = "allowlist " + " ".join(args)
+    erro, linhas = ctx.docker.console(comando)
+    if erro:
+        return erro, []
+    return "", limpa_resposta(comando, linhas)
+
+
+def tem_nome(linhas: list[str], nome: str) -> bool:
+    """O nome aparece na resposta do console?"""
+    alvo = nome.lower()
+    return any(alvo in linha.lower() for linha in linhas)
+
+
+def _aviso_arquivo(ctx: AppContext, erro: str, gravou: bool, o_que: str) -> str:
+    """O que dizer quando so deu para mexer no arquivo, e nao no console.
+
+    O detalhe que muda tudo: se o BDS esta PARADO, o proximo boot le o arquivo
+    e a entrada entra na memoria dele - ai funciona, e o /reiniciar resolve. Se
+    o BDS esta RODANDO e o console nao responde, o proximo stop faz o servidor
+    reescrever o arquivo a partir da lista velha e a edicao se perde; mandar
+    reiniciar seria exatamente o jeito de perder a entrada. Nesse caso o
+    caminho e' o console.
+    """
+    if not gravou:
+        return f"Nao consegui falar com o console do BDS: {erro}. Ele nem estava no arquivo."
+    try:
+        rodando = ctx.docker.state().running
+    except Exception:  # noqa: BLE001 - o aviso nao pode falhar por causa do docker
+        rodando = True
+    if not rodando:
+        return (
+            f"Nao consegui falar com o console do BDS: {erro}. Como o servidor esta parado, "
+            f"{o_que} no allowlist.json e o proximo boot ja le isso."
+        )
+    return (
+        f"Nao consegui falar com o console do BDS: {erro}. {o_que.capitalize()} no allowlist.json, "
+        "mas o servidor esta rodando e ele reescreve esse arquivo quando desliga: um restart agora "
+        "apagaria a entrada. O jeito que segura e pelo console - o /permitir de novo, quando ele "
+        "responder."
+    )
+
+
+async def poe_na_lista(ctx: AppContext, nome: str, xuid: str | None = None) -> tuple[bool, str]:
+    """Coloca o jogador na allow-list. Devolve (entrou, o que o admin precisa saber).
+
+    O console vem primeiro porque o 'allowlist add' e' o caminho que sobrevive:
+    o BDS resolve o XUID, grava o arquivo no formato dele e ja passa a valer
+    para o servidor que esta rodando. O arquivo so e' tocado quando o console
+    nao responde, e nesse caso a entrada so vale no proximo boot.
+    """
+    erro, _linhas = await asyncio.to_thread(allowlist_no_console, ctx, "add", serverctl.cita(nome))
+    if not erro:
+        _erro, listadas = await asyncio.to_thread(allowlist_no_console, ctx, "list")
+        if tem_nome(listadas, nome):
+            return True, ""
+        # o comando foi entregue e o servidor nao devolveu o nome: nao da para
+        # dizer que liberou. Fala isso em vez de mentir com um "pronto".
+        return True, (
+            "Mandei 'allowlist add' mas o console nao devolveu o nome em "
+            "'allowlist list'. Se ela nao entrar, mande /lista: ele mostra o "
+            "que o servidor tem carregado."
+        )
+
+    novo = await asyncio.to_thread(ctx.server.add_allowlist, nome, xuid)
+    await asyncio.to_thread(allowlist_no_console, ctx, "reload")
+    return novo, _aviso_arquivo(ctx, erro, novo, "gravei")
+
+
+async def tira_da_lista(ctx: AppContext, nome: str) -> tuple[bool, str]:
+    """Tira o jogador da allow-list. Devolve (saiu, o que o admin precisa saber)."""
+    erro, _linhas = await asyncio.to_thread(allowlist_no_console, ctx, "remove", serverctl.cita(nome))
+    if not erro:
+        return True, ""
+    removido = await asyncio.to_thread(ctx.server.remove_allowlist, nome)
+    return removido, _aviso_arquivo(ctx, erro, removido, "tirei")
+
+
+async def liga_a_lista(ctx: AppContext, by: int) -> str:
+    """Liga a allow-list no arquivo e no servidor. Devolve um aviso, se houver.
+
+    Sem isso o /permitir nao libera ninguem: a propriedade e lida so no boot, e
+    enquanto ela estiver desligada a lista nao bloqueia nem libera ninguem.
+    """
+    props = await asyncio.to_thread(ctx.server.le_props)
+    if props.get("allow-list") == "true":
+        return ""
+    await asyncio.to_thread(ctx.server.set_prop, "allow-list", "true")
+    ctx.store.set_override("allow-list", "true", by)
+    erro, _linhas = await asyncio.to_thread(allowlist_no_console, ctx, "on")
+    if erro:
+        return f"Gravei allow-list=true, mas o console nao aceitou o 'allowlist on' ({erro})."
+    return "A lista estava desligada; liguei agora e tambem gravei allow-list=true, entao o proximo boot ja vem ligada."
 
 
 def _fmt_uptime(started_at: str) -> str:

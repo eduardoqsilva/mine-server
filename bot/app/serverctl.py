@@ -4,9 +4,13 @@ O bot e o dono do /data/server.properties. O image nao reescreve o arquivo
 inteiro: o bedrock-entry.sh so joga nele as propriedades que tem variavel de
 ambiente SETADA, entao o que o bot grava fica. As variaveis do compose que
 brigariam com o arquivo (GAMEMODE, DIFFICULTY...) foram deixadas de fora de
-proposito, para o /config do Telegram ser a unica fonte. A excecao e
-LEVEL_NAME, que o image usa tambem para escolher a pasta do mundo: la quem
-manda e o compose, e o /config level-name avisa.
+proposito, para o /config do Telegram ser a unica fonte.
+
+Duas chaves sao excecao e estao em DO_COMPOSE: LEVEL_NAME e SERVER_UDP_PORTS.
+La quem manda e o compose, porque a imagem reescreve as duas em todo boot. O
+bot ainda deixa o /config escrever no arquivo (para o admin ver o valor
+mudando), mas nao guarda override delas: o reconciliador ficaria reescrevendo
+algo que o boot seguinte desfaz.
 """
 
 from __future__ import annotations
@@ -105,9 +109,10 @@ CATALOGO: tuple[Prop, ...] = (
         "Faixa UDP do nethernet",
         "portas",
         cuidado=(
-            "atras de firewall o nethernet so conecta com faixa fixa: "
-            "o externo tem que bater com a faixa publicada no compose. "
-            "Vazio volta a usar as portas efemeras e so funciona em LAN"
+            "o SERVER_UDP_PORTS do .env manda nesta: a imagem reescreve em todo "
+            "boot, entao o que eu gravo aqui so vale ate o proximo restart. "
+            "Mude la (e no host/firewall.sh) para valer. Atras de firewall o "
+            "nethernet so conecta com faixa fixa e 1:1 entre externo e interno"
         ),
     )
     # "transport" fica de fora de proposito: no BDS 1.26.52+ o nethernet e o
@@ -117,6 +122,45 @@ CATALOGO: tuple[Prop, ...] = (
 )
 
 POR_CHAVE = {p.key: p for p in CATALOGO}
+
+# Propriedades em que quem manda e o compose. Sao as duas que o entry script
+# precisa ler do ambiente para funcionar (o nome da pasta do mundo e o
+# endereco anunciado do nethernet), entao a imagem as escreve no
+# server.properties em todo boot. Um override do bot aqui seria um
+# alinhamento impossivel: o reconciliador escreveria a cada 60s e o boot
+# seguinte desfaria.
+DO_COMPOSE: frozenset[str] = frozenset({"level-name", "server-udp-ports"})
+
+
+def do_compose(chave: str) -> bool:
+    """Essa propriedade e reescrita pelo compose em todo boot?"""
+    return chave in DO_COMPOSE
+
+
+def comando_ao_vivo(chave: str, valor: str) -> str:
+    """O comando de console que aplica a propriedade sem reiniciar ('' se nao ha).
+
+    Vale para as duas que o BDS le ao vivo. O resto (dificuldade, distancia de
+    visao, gamemode) so entra no proximo boot, e nao ha comando para isso: a
+    doc do BDS so traz changesetting para allow-cheats e difficulty.
+    """
+    if chave == "allow-list":
+        # A doc e explicita: allowlist on/off liga e desliga em runtime e "does
+        # not change the value in the server.properties file". Por isso o
+        # /config continua gravando o arquivo tambem - o comando sozinho
+        # resolveria so ate o proximo boot.
+        return "allowlist on" if valor == "true" else "allowlist off"
+    return ""
+
+
+def cita(nome: str) -> str:
+    """Como o gamertag tem que ir num comando de console do BDS.
+
+    A doc oficial: "If there is a white-space in the Gamertag you need to
+    enclose it with double quotes". Sem aspas, 'allowlist add Example Name'
+    vira duas palavras e o servidor nunca acha o jogador.
+    """
+    return f'"{nome}"' if any(c.isspace() for c in nome) else nome
 
 
 def interpreta_config(args: list[str]) -> tuple[str, str, bool] | None:
@@ -313,10 +357,21 @@ class ServerControl:
     def add_allowlist(self, nome: str, xuid: str | None = None, log_txt: str | None = None) -> bool:
         """True se entrou como novo.
 
-        O Bedrock usa o XUID para validar a entrada em allow-list. Quando o
-        comando vem apenas com o nickname, tentamos resolver o XUID no log do
-        servidor antes de gravar a entrada; se o registro ja existe sem XUID,
-        tambem atualizamos para o valor correto.
+        Caminho de reserva: o jeito normal de liberar alguem e o console
+        ('allowlist add'), porque o BDS resolve o XUID sozinho e salva a lista
+        no formato dele. Isto aqui so serve quando o console nao responde
+        (Docker Desktop), e ai o arquivo precisa mudar na mao.
+
+        O XUID e opcional de proposito, nao por preguiça: a doc do BDS diz que
+        "if it's not set then it will be populated when someone with a matching
+        name connects". Exigir o numero aqui barraria exatamente quem nunca
+        conseguiu entrar, que e quem precisa da permissao - e o XUID adivinhado
+        no log, quando errado, e pior do que nenhum: o BDS valida a entrada por
+        ele.
+
+        Um XUID que ja esta na entrada nunca e trocado. Quem preenche a lista e
+        o proprio BDS, nao a gente; se o numero informado divergir do que o
+        servidor gravou, um dos dois esta errado, e o servidor ganha a duvida.
         """
         dados = self.allowlist()
         alvo = nome.lower()
@@ -331,14 +386,15 @@ class ServerControl:
                     item["xuid"] = str(xuid)
                 if not item.get("name"):
                     item["name"] = nome
-                if xuid and xuid_atual and xuid_atual != xuid:
-                    item["xuid"] = str(xuid)
                 self._salva_lista(self.allowlist_path, dados)
                 return False
 
-        entrada: dict[str, str] = {"name": nome}
+        # o BDS escreve as tres chaves, nessa ordem, e preenche o xuid depois.
+        # Gravar so name deixaria um arquivo que nao parece com o que o
+        # servidor escreve de volta.
+        entrada: dict[str, object] = {"ignoresPlayerLimit": False, "name": nome}
         if xuid:
-            entrada = {"xuid": str(xuid), "name": nome}
+            entrada["xuid"] = str(xuid)
         dados.append(entrada)
         self._salva_lista(self.allowlist_path, dados)
         return True
@@ -376,7 +432,13 @@ class ServerControl:
         return True
 
     def xuid_no_log(self, nome: str, log_txt: str) -> str | None:
-        """Acha o XUID do jogador no log do BDS (ele imprime quando o cara entra)."""
+        """Acha o XUID do jogador no log do BDS (ele imprime quando o cara entra).
+
+        Serve para o /ops, que escreve no permissions.json - la o XUID e
+        obrigatorio mesmo. Para a allow-list nao: o BDS resolve o proprio na
+        primeira conexao, e um numero adivinhado errado trava o jogador em vez
+        de liberar.
+        """
         alvo = nome.lower()
         for linha in reversed(log_txt.splitlines()):
             if alvo in linha.lower():

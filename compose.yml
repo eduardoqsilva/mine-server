@@ -34,11 +34,25 @@ services:
       # grava por /config fica no arquivo, e o que o bot guardou no SQLite
       # (/state/bot.db) reaparece sozinho pelo reconciliador de 60s.
       #
-      # A excecao e o LEVEL_NAME: ele e das duas coisas ao mesmo tempo, porque
-      # o entry usa para montar worlds/<LEVEL_NAME> e o set-property escreve
-      # level-name. Quem manda no nome da pasta do mundo e o compose; o bot
-      # avisa isso no /config level-name.
+      # Duas excecoes, em que quem manda e o compose:
+      #   LEVEL_NAME  - o entry usa para montar worlds/<LEVEL_NAME>
+      #   SERVER_UDP_PORTS - so o address hint das portas de gameplay
+      #
+      # Nos dois o bot avisa no /config da chave e nao guarda override: um
+      # override aqui seria reescrito no boot seguinte de qualquer jeito.
       LEVEL_NAME: "${LEVEL_NAME:-world}"
+      # Atras de NAT (que e o caso de quase toda VPS publica) o nethernet
+      # anuncia o IP privado da interface, que ninguem de fora alcanca, e o
+      # cliente morre em "Door"/InitialConnection sem evento no console. A
+      # forma de falar o IP publico e server-udp-ports=<ip>:<externo>:<interno>,
+      # e a imagem aplica isso no arquivo antes de todo boot - por isso fica
+      # aqui e nao no /config do bot.
+      #
+      # A faixa tem que bater com a liberada no host/firewall.sh (UDP_PORTS) e
+      # com a do provedor. Formato aceito pelo BDS: 19133, 19133-19172,
+      # externo:interno ou externo:faixa:faixa. Vazio volta a usar portas
+      # efemeras, que so funcionam em LAN.
+      SERVER_UDP_PORTS: "${SERVER_UDP_PORTS:-157.151.1.224:19133-19172:19133-19172}"
       # OFF de proposito. Isto e' o servidor responder a quem procura servidores
       # na LAN. Numa VPS publica nao serve pra nada e vaza o servidor para
       # qualquer rede em que alguem se plugue (wifi de cafe, rede do vizinho).

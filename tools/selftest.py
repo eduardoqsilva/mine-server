@@ -5,6 +5,7 @@ Roda em qualquer maquina:  python tools/selftest.py
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import re
@@ -33,8 +34,49 @@ if "aiogram" not in sys.modules:
         class Bot:  # so a assinatura, auth.py nunca instancia no teste
             pass
 
+        class _Observador:
+            """Cuida de .middleware(...) e de ser usado como @router.message(...).
+
+            O Router do aiogram e' as duas coisas: no admin.py ele recebe
+            middlewares e tambem decora os handlers. Um duble so de assinatura
+            passaria no import e estouraria no uso, entao os dois caminhos
+            ficam cobertos aqui.
+            """
+
+            def __init__(self, nome: str = "") -> None:
+                self.nome = nome
+                self.handlers: list[object] = []
+                self.middlewares: list[object] = []
+
+            def middleware(self, mw: object) -> object:
+                self.middlewares.append(mw)
+                return mw
+
+            def __call__(self, *args: object, **kwargs: object) -> object:
+                def deco(func: object) -> object:
+                    self.handlers.append(func)
+                    return func
+
+                return deco
+
+        class Router(_Observador):
+            def __init__(self, name: str = "") -> None:
+                super().__init__(name)
+                self.message = _Observador("message")
+                self.callback_query = _Observador("callback_query")
+
+        class _Filtro:
+            """F.data.startswith(...) e' o unico uso de F no admin."""
+
+            class data:
+                @staticmethod
+                def startswith(prefixo: str) -> tuple[str, str]:
+                    return ("data", prefixo)
+
         falso.BaseMiddleware = BaseMiddleware
         falso.Bot = Bot
+        falso.Router = Router
+        falso.F = _Filtro
         falso.__path__ = []  # permite "import aiogram.types"
 
         tipos = types.ModuleType("aiogram.types")
@@ -42,10 +84,39 @@ if "aiogram" not in sys.modules:
         class Message:  # usado no isinstance do AdminOnly
             pass
 
+        class CallbackQuery:
+            pass
+
+        class InlineKeyboardButton:
+            def __init__(self, text: str = "", callback_data: str = "") -> None:
+                self.text = text
+                self.callback_data = callback_data
+
+        class InlineKeyboardMarkup:
+            def __init__(self, inline_keyboard: object = None) -> None:
+                self.inline_keyboard = inline_keyboard
+
         tipos.Message = Message
+        tipos.CallbackQuery = CallbackQuery
+        tipos.InlineKeyboardButton = InlineKeyboardButton
+        tipos.InlineKeyboardMarkup = InlineKeyboardMarkup
         falso.types = tipos
+
+        filtros = types.ModuleType("aiogram.filters")
+
+        class Command:  # so a assinatura: o filtro nunca roda no teste
+            def __init__(self, *nomes: str) -> None:
+                self.nomes = nomes
+
+        class CommandObject:
+            args: str | None = None
+
+        filtros.Command = Command
+        filtros.CommandObject = CommandObject
+        falso.filters = filtros
         sys.modules["aiogram"] = falso
         sys.modules["aiogram.types"] = tipos
+        sys.modules["aiogram.filters"] = filtros
 
 if "docker" not in sys.modules:
     try:  # docker so existe no container; aqui a gente testa logica pura
@@ -74,6 +145,7 @@ if "docker" not in sys.modules:
         sys.modules["docker.errors"] = erros
 
 from app import addons  # noqa: E402
+from app import admin  # noqa: E402
 from app import auth  # noqa: E402
 from app import backup  # noqa: E402
 from app import docker_ctl  # noqa: E402
@@ -626,6 +698,30 @@ def test_serverctl() -> None:
                 check(f"udp barra {ruim!r}", True)
         check("udp e perigosa", bool(udp.cuidado))
 
+        # Quem manda no server-udp-ports e o compose (a imagem reescreve em todo
+        # boot pelo SERVER_UDP_PORTS), entao o reconciliador nao pode brigar com
+        # ele e o /config nao pode guardar override.
+        check("server-udp-ports e do compose", serverctl.do_compose("server-udp-ports"))
+        check("level-name e do compose", serverctl.do_compose("level-name"))
+        check("difficulty nao e do compose", not serverctl.do_compose("difficulty"))
+        check(
+            "cuidado do udp aponta pro .env",
+            "SERVER_UDP_PORTS" in udp.cuidado,
+            udp.cuidado,
+        )
+
+        # allow-list tem comando de console; o resto do catalogo nao tem
+        check("allow-list liga ao vivo", serverctl.comando_ao_vivo("allow-list", "true") == "allowlist on")
+        check("allow-list desliga ao vivo", serverctl.comando_ao_vivo("allow-list", "false") == "allowlist off")
+        check("difficulty nao tem comando ao vivo", serverctl.comando_ao_vivo("difficulty", "hard") == "")
+
+        # gamertag com espaco precisa de aspas no console, senao o BDS le duas
+        # palavras e nunca acha o jogador
+        check("nome sem espaco nao leva aspas", serverctl.cita("ExampleName") == "ExampleName")
+        check("nome com espaco vai entre aspas", serverctl.cita("Example Name") == '"Example Name"')
+        check("valor aceito pelo valida", serverctl.valida(udp, "157.151.1.224:19133-19172:19133-19172")
+              == "157.151.1.224:19133-19172:19133-19172")
+
         srv.set_prop("level-name", "Mundo Novo")
         check("nome do mundo com espaco", srv.nivel_do_mundo("world") == "Mundo Novo", srv.nivel_do_mundo("world"))
 
@@ -645,7 +741,11 @@ def test_serverctl() -> None:
             srv.add_allowlist("Ana", log_txt="[2026] Player connected: Ana/9999999999999999") is False,
             srv.allowlist(),
         )
-        check("xuid da entrada existente foi atualizado", srv.allowlist()[1]["xuid"] == "9999999999999999", srv.allowlist())
+        # quem preenche a lista e o BDS. Se o xuid informado diverge do que o
+        # servidor ja gravou, um dos dois esta errado - e o servidor ganha a
+        # duvida. Sobrescrever aqui ja quebrou gente no passado.
+        srv.add_allowlist("Ana", "1111111111111111")
+        check("xuid divergente nao sobrescreve", srv.allowlist()[1]["xuid"] == "9999999999999999", srv.allowlist())
 
         check("remocao funciona", srv.remove_allowlist("Ana") and srv.remove_allowlist("Bia") and len(srv.allowlist()) == 1)
         check("remover ausente nao quebra", srv.remove_allowlist("Fantasma") is False)
@@ -666,6 +766,19 @@ def test_serverctl() -> None:
         log = "[2026] Player connected: Ze/2535453759792258"
         check("xuid encontrado no log", srv.xuid_no_log("Ze", log) == "2535453759792258")
         check("xuid ausente vira None", srv.xuid_no_log("Ninguem", log) is None)
+
+        # O BDS escreve as tres chaves e preenche o xuid depois. Se a gente
+        # grava so name, o arquivo nao parece com o que o servidor escreve de
+        # volta - e e assim que a edicao na mao do allowlist.json foi perdida.
+        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
+        srv.add_allowlist("Bia")
+        entrada = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))[0]
+        check("entrada nova tem as tres chaves do BDS", list(entrada) == ["ignoresPlayerLimit", "name"], entrada)
+        check("ignoresPlayerLimit falso", entrada["ignoresPlayerLimit"] is False, entrada)
+        check("entrada sem xuid nao inventa numero", "xuid" not in entrada, entrada)
+        # sem xuid a entrada ainda e valida: e assim que a doc do BDS descreve
+        # (o xuid e preenchido quando o jogador entra)
+        check("nome sozinho e jogo valido", json.loads((data / "allowlist.json").read_text(encoding="utf-8"))[0]["name"] == "Bia")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -697,6 +810,35 @@ def test_interpreta_config() -> None:
     check("fluxo completo aplica", (chave, valor) == ("level-seed", "abc") and not conf(serverctl.POR_CHAVE[chave], ok))
 
 
+def test_nome_do_gamertag() -> None:
+    """Como o gamertag sobrevive a '/permitir <nome> [xuid]'.
+
+    Gamertag com espaco tem que chegar inteiro no BDS, e a doc oficial exige
+    aspas. O lado perigoso do parser e' o outro: liberar 'Ze' quando o jogador
+    se chama 'Ze Do Zero' nao da erro nenhum, o bot so vai descobrir que nao
+    funcionou quando o jogador tentar entrar de novo. Por isso sobra de
+    argumento vira aviso, nao nome silenciosamente cortado.
+    """
+    print("\ngamertag: nome, aspas e xuid opcional")
+    nome, xuid, sobra = admin._nome_e_xuid("Ze")
+    check("gamertag simples", (nome, xuid, sobra) == ("Ze", None, ""), (nome, xuid, sobra))
+    nome, xuid, sobra = admin._nome_e_xuid('"Ze Do Zero"')
+    check("gamertag com espaco entre aspas", (nome, xuid, sobra) == ("Ze Do Zero", None, ""), (nome, xuid, sobra))
+    nome, xuid, sobra = admin._nome_e_xuid("Ze 2535453759792258")
+    check("xuid opcional no fim", (nome, xuid, sobra) == ("Ze", "2535453759792258", ""), (nome, xuid, sobra))
+    nome, xuid, sobra = admin._nome_e_xuid('"Ze Do Zero" 2535453759792258')
+    check("aspas e xuid juntos", (nome, xuid) == ("Ze Do Zero", "2535453759792258"), (nome, xuid))
+    nome, xuid, sobra = admin._nome_e_xuid("Ze Do Zero")
+    check("sem aspas, sobra vira aviso", (nome, xuid, sobra) == ("Ze", None, "Do Zero"), (nome, xuid, sobra))
+    check("vazio nao quebra", admin._nome_e_xuid("") == ("", None, ""))
+    check("aspas quebrada nao vira aspa no nome", admin._nome_e_xuid('"Ze Do') == ("Ze", None, "Do"))
+    # o console recebe o mesmo nome, com aspas de novo
+    check("mesmo nome vai citado para o console", serverctl.cita("Ze Do Zero") == '"Ze Do Zero"')
+    # e os outros comandos usam a mesma quebra
+    check("negar quebra igual", admin._tokens('"Ze Do Zero" quebrando') == ["Ze Do Zero", "quebrando"])
+    check("chutar mantem o motivo inteiro", admin._tokens('"Ze Do Zero" quebrando o servidor')[-1] == "servidor")
+
+
 def test_config_persiste() -> None:
     """O /config tem que sobreviver ao boot do container e ao recreate do bot.
 
@@ -712,6 +854,11 @@ def test_config_persiste() -> None:
         data.mkdir()
         props = data / "server.properties"
         padrao = "server-name=Revolucao\ndifficulty=easy\nmax-players=10\n"
+        # o que a imagem deixa no arquivo depois do boot quando LEVEL_NAME e
+        # SERVER_UDP_PORTS estao setados: essas duas ganham do compose
+        padrao_compose = (
+            padrao + "level-name=MundoNovo\nserver-udp-ports=19133-19172\n"
+        )
         props.write_text(padrao, encoding="utf-8")
         db = tmp / "state" / "bot.db"
 
@@ -744,6 +891,35 @@ def test_config_persiste() -> None:
         srv2 = serverctl.ServerControl(data)
         ctx2 = SimpleNamespace(store=st2, server=srv2)
         check("override sobrevive ao recreate", st2.overrides() == {"difficulty": "hard"}, st2.overrides())
+
+        # server-udp-ports e level-name sao do compose: o reconciliador nao pode
+        # reescrever nada la, senao ele e a imagem brigam a cada 60s e o boot
+        # seguinte desfaz o que o reconciliador fez. Teste em data proprio para
+        # nao mexer na contagem de backups acima.
+        with tempfile.TemporaryDirectory() as tmp_comp:
+            data_c = Path(tmp_comp)
+            (data_c / "server.properties").write_text(padrao, encoding="utf-8")
+            stc = store.Store(data_c / "bot.db")
+            srv_c = serverctl.ServerControl(data_c)
+            ctx_c = SimpleNamespace(store=stc, server=srv_c)
+            stc.set_override("difficulty", "hard", 42)
+            stc.set_override("server-udp-ports", "19133-19172", 42)
+            stc.set_override("level-name", "Mundo", 42)
+            # o boot da imagem sobrescreve as duas; o reconciliador tem de
+            # repassar por cima do que a imagem fez, e so do difficulty
+            (data_c / "server.properties").write_text(padrao_compose, encoding="utf-8")
+            so_comp = [k for k, _v, _a in ops.overrides_sujo(ctx_c)]
+            check("reconciliador ignora o que e do compose", so_comp == ["difficulty"], so_comp)
+            check("aplicar nao toca nas chaves do compose", ops.aplica_overrides(ctx_c) == ["difficulty=hard"])
+            lido = srv_c.le_props()
+            check("level-name do compose nao foi sobrescrito", lido["level-name"] == "MundoNovo", lido)
+            check(
+                "server-udp-ports do compose nao foi sobrescrito",
+                lido["server-udp-ports"] == "19133-19172",
+                lido,
+            )
+            check("difficulty continua sob controle do bot", lido["difficulty"] == "hard", lido)
+            stc.fecha()
 
         props.write_text(padrao, encoding="utf-8")
         check("reaplicou depois do recreate", ops.aplica_overrides(ctx2) == ["difficulty=hard"])
@@ -914,6 +1090,128 @@ def test_console() -> None:
     check("sem sobreposicao nao inventa", docker_ctl._delta(["A", "B"], ["X", "Y"]) == [])
     check("log vazio antes devolve tudo", docker_ctl._delta([], ["A"]) == ["A"])
     check("nada novo devolve vazio", docker_ctl._delta(["A", "B"], ["A", "B"]) == [])
+
+
+def test_allowlist() -> None:
+    """O /permitir tem que liberar o jogador no BDS que esta rodando.
+
+    O caminho e' 'allowlist add' no console, e nao a edicao do
+    allowlist.json: o BDS reescreve esse arquivo quando desliga, a partir da
+    lista que tem em memoria, entao quem escreve no arquivo sem o servidor
+    saber tem a entrada apagada no proximo stop.
+    """
+    print("\nallowlist: liberar no console e conferir, com o arquivo como reserva")
+
+    class _Console:
+        """DockerController de mentira: responde o allowlist list como o BDS.
+
+        O codigo manda o comando inteiro numa string so
+        ("allowlist add \\"Example Name\\""), como o send-command espera, entao
+        o fake quebra em partes para saber o que responder.
+        """
+
+        def __init__(self, lista: list[str], recusa: str = "", rodando: bool = True) -> None:
+            self.lista = lista
+            self.recusa = recusa
+            self.rodando = rodando
+            self.comandos: list[str] = []
+
+        def state(self):
+            return SimpleNamespace(running=self.rodando, status="running" if self.rodando else "exited")
+
+        def console(self, *args: str, **kwargs) -> tuple[str, list[str]]:
+            bruto = args[0]
+            self.comandos.append(bruto)
+            if self.recusa:
+                return self.recusa, []
+            partes = bruto.split(maxsplit=2)
+            comando = partes[1] if len(partes) > 1 and partes[0] == "allowlist" else bruto
+            nome = partes[2].strip('"') if len(partes) > 2 else ""
+            if comando == "add":
+                if nome not in self.lista:
+                    self.lista.append(nome)
+                return "", []
+            if comando == "remove":
+                if nome in self.lista:
+                    self.lista.remove(nome)
+                return "", []
+            if comando == "list":
+                return "", list(self.lista)
+            return "", []
+
+    with tempfile.TemporaryDirectory() as tmp_al:
+        data = Path(tmp_al)
+        (data / "server.properties").write_text("allow-list=false\n", encoding="utf-8")
+        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
+        st = store.Store(data / "bot.db")
+        srv = serverctl.ServerControl(data)
+        ctx = SimpleNamespace(store=st, server=srv)
+
+        # --- console responde: o caminho bom ---
+        docker = _Console(["Ze"])
+        ctx.docker = docker
+        check("console de mentira pronto", docker.console("allowlist list")[1] == ["Ze"])
+
+        entrou, aviso = asyncio.run(ops.poe_na_lista(ctx, "Example Name"))
+        check("entrou pela lista do servidor", entrou and aviso == "", (entrou, aviso))
+        check("add foi pelo console", 'allowlist add "Example Name"' in docker.comandos, docker.comandos)
+        check("confirmou com allowlist list", "allowlist list" in docker.comandos, docker.comandos)
+        check("nome com espaco foi entre aspas", "Example Name" in docker.lista, docker.lista)
+        check("arquivo nao foi tocado", json.loads((data / "allowlist.json").read_text(encoding="utf-8")) == [])
+
+        # o nome precisa aparecer de verdade na resposta: se nao aparecer, o
+        # bot nao pode dizer que liberou
+        class _Mudo(_Console):
+            def console(self, *args: str, **kwargs) -> tuple[str, list[str]]:
+                self.comandos.append(args[0])
+                return "", []
+
+        docker_mudo = _Mudo([])
+        ctx.docker = docker_mudo
+        entrou, aviso = asyncio.run(ops.poe_na_lista(ctx, "Fantasma"))
+        check("sem confirmacao, nao diz que liberou", entrou and "nao devolveu o nome" in aviso, (entrou, aviso))
+
+        # --- console recusado com o servidor RODANDO: o arquivo nao segura ---
+        # O BDS reescreve o allowlist.json quando desliga, a partir da lista
+        # que ele tem em memoria. Se o console nao responde, a entrada no
+        # arquivo morre no proximo stop - e mandar reiniciar seria o jeito
+        # certo de perder a edicao. O aviso tem que dizer isso.
+        recusa = "ERROR: failed to search for bedrock server process"
+        ctx.docker = _Console([], recusa=recusa, rodando=True)
+        entrou, aviso = asyncio.run(ops.poe_na_lista(ctx, "Bia"))
+        check("fallback grava no arquivo", entrou, (entrou, aviso))
+        check("fallback avisa que o restart apagaria", "apagaria a entrada" in aviso, aviso)
+        check("fallback nao manda reiniciar", "/reiniciar" not in aviso, aviso)
+        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
+        check("arquivo tem a entrada no formato do BDS", salvos == [{"ignoresPlayerLimit": False, "name": "Bia"}], salvos)
+
+        # --- console recusado com o servidor PARADO: ai o boot resolve ---
+        ctx.docker = _Console([], recusa=recusa, rodando=False)
+        entrou, aviso = asyncio.run(ops.poe_na_lista(ctx, "Caio"))
+        check("servidor parado: o boot le o arquivo", "proximo boot ja le isso" in aviso, aviso)
+        check("e diz o motivo do console", "failed to search" in aviso, aviso)
+
+        # remover tambem passa pelo console quando ele existe
+        docker_ok = _Console(["Bia", "Ze"])
+        ctx.docker = docker_ok
+        saiu, aviso = asyncio.run(ops.tira_da_lista(ctx, "Bia"))
+        check("removeu pelo console", saiu and aviso == "" and docker_ok.lista == ["Ze"], (saiu, aviso, docker_ok.lista))
+
+        # --- ligar a lista: propriedade e runtime, os dois ---
+        check("comeca desligada", srv.le_props()["allow-list"] == "false", srv.le_props())
+        aviso = asyncio.run(ops.liga_a_lista(ctx, 42))
+        check("mandou allowlist on", "allowlist on" in docker_ok.comandos, docker_ok.comandos)
+        check("graveu allow-list=true no arquivo", srv.le_props()["allow-list"] == "true", srv.le_props())
+        check("guardou o override", st.overrides().get("allow-list") == "true", st.overrides())
+        check("avisa que ligou agora", "ja vem ligada" in aviso, aviso)
+
+        # ja ligada no arquivo e no override: nao ha o que fazer
+        docker_ok2 = _Console([])
+        ctx.docker = docker_ok2
+        aviso = asyncio.run(ops.liga_a_lista(ctx, 42))
+        check("lista ja ligada nao repete trabalho", aviso == "" and docker_ok2.comandos == [], (aviso, docker_ok2.comandos))
+
+        st.fecha()
 
 
 def test_dropbox() -> None:
@@ -1291,8 +1589,6 @@ def test_backup() -> None:
 def test_ops_backup() -> None:
     """O caminho de erro do /backup: o servidor volta e a vigia volta a olhar."""
     print("backup: fluxo de erro do /backup")
-    import asyncio
-    from types import SimpleNamespace
 
     class _Docker:
         """DockerController que para e religa na hora, sem Docker nenhum."""
@@ -1455,8 +1751,10 @@ if __name__ == "__main__":
         test_auth,
         test_serverctl,
         test_interpreta_config,
+        test_nome_do_gamertag,
         test_config_persiste,
         test_console,
+        test_allowlist,
         test_dropbox,
         test_backup,
         test_ops_backup,

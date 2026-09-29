@@ -6,12 +6,20 @@ import pathlib
 import sys
 
 ALVOS = {".py", ".yml", ".yaml", ".md", ".txt", ".conf", ".stream", ".exemplo", ".example", ""}
+# Diretorios de artefato: nao sao texto do projeto. O data/ tem o LevelDB do
+# mundo (binario) e arquivos de backup que o proprio BDS escreve, e o
+# .ruff_cache/ e .pytest_cache/ sao binarios de ferramenta. Sem esta lista o
+# check acusa lixo de outra pessoa e para de valer.
+IGNORADOS = {
+    ".git", "data", "state", "backups", "worlds",
+    ".ruff_cache", ".pytest_cache", ".mypy_cache", "__pycache__", ".venv", "venv", "node_modules",
+}
 MOJIBAKE = ("\u00c3", "\u00e2\u20ac", "\u00f0\u0178", "\u00ef\u00bf\u00bd", "\u00c2", "\ufffd")
 RUINS = ("bringing", "Use `--stop`")
 
 problemas = 0
 for p in sorted(pathlib.Path(".").rglob("*")):
-    if not p.is_file() or ".git" in p.parts or p.suffix not in ALVOS:
+    if not p.is_file() or IGNORADOS.intersection(p.parts) or p.suffix not in ALVOS:
         continue
     if p.name == "check_encoding.py":  # a lista de lixo mora aqui dentro
         continue

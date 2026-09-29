@@ -108,8 +108,10 @@ Regras que o bot aplica:
 
 1. O `compose.yml` roda o `bds` em `network_mode: host`, entao o container
    escuta direto no host: nao existe bloco `ports:` e nao existe mapeamento.
-   A faixa UDP tem que bater com o `server-udp-ports` do
-   `data/server.properties`; se mudar la, mude no firewall tambem.
+   A faixa UDP vem do `SERVER_UDP_PORTS` do `.env`, que a imagem escreve no
+   `server.properties` antes de todo boot. O `.env.example` ja vem com
+   `157.151.1.224:19133-19172:19133-19172`; se mudar a faixa, mude no
+   `host/firewall.sh` e no provedor tambem.
 2. Liberar no firewall da maquina e no painel do provedor. No UFW:
    `ufw allow 19132/tcp`, `ufw allow 7551/udp` e `ufw allow 19133:19172/udp`.
    Em distro sem UFW, e o caso da OCI, use o `host/firewall.sh` (abaixo).
@@ -143,12 +145,18 @@ Os jogadores entram em **Adicionar servidor -> Endereço -> `seu.dominio`**.
 > NAT 1:1 no edge. A rede host resolve o problema de *interface*, mas o
 > nethernet passa a anunciar o IP privado, que ninguem de fora alcanca. A
 > correcao nao e mexer no `server-ip` (que e endereco de *bind*: se voce
-> preencher com um IP que nao e local, o BDS nem sobe), e sim no
-> `server-udp-ports`, dizendo o IP publico:
+> preencher com um IP que nao e local, o BDS nem sobe), e sim dizer o IP publico
+> no `SERVER_UDP_PORTS` do `.env`:
 >
 > ```
-> /config server-udp-ports=<IP-PUBLICO>:19133-19172:19133-19172
+> SERVER_UDP_PORTS=<IP-PUBLICO>:19133-19172:19133-19172
+> docker compose up -d bds
 > ```
+>
+> A imagem aplica isso no `server.properties` antes de cada boot, entao nao ha
+> `/config` nem reinicio do bot no meio: o `up -d bds` basta. (O `/config
+> server-udp-ports` continua existindo e ainda escreve no arquivo, mas o
+> `.env` ganha no boot seguinte — o bot avisa isso na hora.)
 >
 > Continua valendo o 1:1 (externo tem que ser igual a interno). Se a faixa
 > larga nao funcionar, liste portas avulsas:
@@ -191,8 +199,8 @@ sudo iptables -L INPUT -n | grep -E 'dpt:19132|dpts:19133:19172|dpt:7551'
 
 O script e' idempotente e so faz `iptables -C` e `-I`: nunca apaga regra alheia,
 nem mexe na `DOCKER-USER` (que nem entra no caminho, ja que o `bds` esta em
-rede host). Se mudar a faixa no `server-udp-ports`, atualize o `UDP_PORTS` do
-servico junto, senao os dois voltam a divergir.
+rede host). Se mudar a faixa no `SERVER_UDP_PORTS` do `.env`, atualize o
+`UDP_PORTS` do servico junto, senao os dois voltam a divergir.
 
 ## Sobre o icone
 
@@ -223,8 +231,8 @@ tela de packs do cliente.
 | `/config <chave> <valor>` | muda na mao (ex.: `/config difficulty hard`) |
 | `/config <chave> <valor> sim` | confirma as propriedades que pedem cuidado |
 | `/config aplicar` | reescreve em `server.properties` o que o bot guardou |
-| `/lista` | quem esta na allow-list e quem esta negado |
-| `/permitir <gamertag> [xuid]` | adiciona na allow-list (liga a lista se preciso) |
+| `/lista` | o que o servidor tem carregado, a propriedade e quem esta negado |
+| `/permitir <gamertag>` | adiciona na allow-list, sem precisar de xuid (liga a lista se preciso) |
 | `/removerjogador <gamertag>` | tira da allow-list |
 | `/negar <gamertag> [motivo]` | tira da lista, manda kick e marca como negado |
 | `/permitido <gamertag>` | tira da lista de negados |
@@ -373,6 +381,49 @@ comando. Comando que nao fala nada (`save-resume`, `stop`) espera os 3s e
 responde "o console nao devolveu nada" — isso e o comando funcionando, nao
 falha. Para derrubar o servidor use `/reiniciar`, que avisa o jogo antes.
 
+**Sobre a allow-list.** Quem manda no `/permitir` é o console do BDS, e não o
+arquivo. O comando é `allowlist add <gamertag>`, e ele faz três coisas de uma
+vez: resolve o XUID na primeira conexão do jogador, grava o `allowlist.json` no
+formato do próprio servidor e já vale para o BDS que está rodando. Sem
+reiniciar.
+
+Isso não é preciosismo. O BDS **reescreve o `allowlist.json` quando desliga**,
+a partir da lista que tem em memória. Quem escreve no arquivo sem o servidor
+saber — porque o `allowlist reload` não chegou, ou o console nem existe — tem a
+entrada apagada no próximo stop. É o "adicionei a pessoa e ela sumiu da lista
+depois de um restart", e é por isso que o bot não aceita mais um
+"pronto" sem conferir: ele roda `allowlist list` depois do `add` e só diz que
+liberou se o nome aparecer na resposta.
+
+Quando o console não responde (é o caso do Docker Desktop no Windows, onde o
+`send-command` não acha o processo do BDS), o bot cai para o arquivo + `allowlist
+reload`, e o aviso depende do estado do servidor:
+
+- **BDS parado** — funciona. O próximo boot lê o arquivo, a entrada entra na
+  memória dele, e a partir daí quem mantém a lista é o próprio BDS.
+- **BDS rodando** — a edição é frágil, e o bot avisa que é. Um `stop` faz o
+  servidor reescrever o arquivo com a lista antiga e a entrada se perde;
+  reiniciar nesse momento seria exatamente o jeito de perder a edição. O
+  caminho que segura é o console: `/permitir` de novo, quando ele responder.
+
+É por isso que o `/permitir` não aceita um "pronto" sem prova: ele roda
+`allowlist list` depois do `add` e só diz que liberou se o nome aparecer na
+resposta.
+
+O `xuid` virou opcional de propósito. A doc do BDS é explícita: *"you don't
+need to specify a XUID here, it will be resolved the first time the player
+connects"*. Exigir o número barrava exatamente quem nunca conseguiu entrar — que
+é quem precisa da permissão — e o número adivinhado no log, quando errado, é
+pior do que nenhum, porque o BDS valida a entrada por ele. Se quiser passar o
+número mesmo, `/permitir <gamertag> <xuid>` ainda aceita.
+
+A `allow-list` do `server.properties` é lida **só no boot**, então o `/permitir`
+manda `allowlist on` (que liga em runtime) e grava `allow-list=true` no arquivo
+para o próximo boot. O `/config allow-list` faz o mesmo e não derruba o servidor.
+O `/lista` mostra as três coisas: o que o servidor tem carregado agora (é isso
+que ele consulta quando alguém tenta entrar), a propriedade do arquivo e as
+entradas com o XUID que o próprio BDS preencheu.
+
 **Sobre "negar"**: o Bedrock nao tem lista de bloqueio. O que o bot faz e tirar o
 jogador da allow-list, mandar `kick` e guardar o nome como negado (o `/permitir`
 recusa ate voce usar `/permitido`). Com a allow-list ligada, isso bloqueia o
@@ -395,20 +446,24 @@ Por isso o `compose.yml` nao passa `GAMEMODE`, `DIFFICULTY`, `MAX_PLAYERS`,
 ganharia a ultima palavra no boot. Mudou algo no `.env`? Mude pelo `/config`
 tambem.
 
-A unica excecao e o **`level-name`**: o `LEVEL_NAME` do compose e o que escolhe
-`worlds/<nome>` e o que escreve `level-name` no arquivo, entao la quem manda e o
-compose. O `/config level-name` avisa e grava do mesmo jeito, mas so vale depois
-de mudar o `LEVEL_NAME` e mover a pasta do mundo.
+As **duas excecoes** ficam com o compose, porque a imagem precisa delas para
+funcionar e reescreve as duas em todo boot: o **`level-name`** (o `LEVEL_NAME`
+escolhe `worlds/<nome>`) e o **`server-udp-ports`** (o `SERVER_UDP_PORTS` e o
+endereco que o nethernet anuncia). Nenhuma das duas guarda override no
+`bot.db`: seria um valor que o reconciliador reescreve a cada 60s e o boot
+seguinte desfaz. O `/config` ainda escreve no arquivo — para o admin ver o
+valor mudando na hora — e avisa que o `.env` ganha no boot seguinte.
 
 Mudancas que o Bedrock so le no boot (dificuldade, distancia de visao, gamemode,
-permissoes) pedem reinicio: o bot faz isso sozinho e avisa. Allow-list e
-permissoes tem `reload` no console, sem derrubar o servidor.
+permissoes) pedem reinicio: o bot faz isso sozinho e avisa. `allow-list` e
+permissoes tem comando no console, sem derrubar o servidor.
 
 Propriedades marcadas como **cuidado** (semente do mundo, porta do jogo,
 `server-port`, `level-seed`, autenticacao...) nao mudam de primeira: o bot explica
-o risco e so aplica no comando repetido com `sim` no fim, para ninguem derrubar
-o servidor com um `/config` errado. `sim` sozinho continua sendo valor valido
+o risco e so aplica no comando repetido com `sim` no fim, para ninguem derrubar o
+servidor com um `/config` errado. `sim` sozinho continua sendo valor valido
 (`/config allow-list sim` liga a lista).
+
 
 ### Leitura
 
@@ -482,11 +537,12 @@ Sintoma por etapa:
 | passo 1 responde, mas da rede nao conecta | `19132/tcp` fechada no firewall/ingress do provedor |
 | `ping -c1` responde *Host Unreachable* | o `REJECT icmp-host-prohibited` do cloud-init da OCI esta barrando localmente; a porta aberta no painel nao adianta. Use `host/firewall.sh` |
 | `NetworkMode` do container != `host` | volte ao `compose.yml`: em bridge o nethernet anuncia o IP privado do container e nenhum ajuste de porta resolve |
-| a rede conecta e o jogo trava ao spawnar | **falta a faixa UDP**: `server-udp-ports` vazio ou divergente da faixa liberada, ou o firewall bloqueando 19133-19172 |
-| passo 4 mostra porta efemera (`7FFE` etc) | `server-udp-ports` nao foi honrado; o gameplay sorteia porta e morre atras de NAT |
-| so da rede local funciona, de fora nao | NAT/ingress do provedor: ajuste o `server-udp-ports` para o IP publico. **Nao** mexa no `server-ip` (e' bind, e nao valor anunciado) |
+| a rede conecta e o jogo trava ao spawnar | **falta a faixa UDP**: `SERVER_UDP_PORTS` vazio ou divergente da faixa liberada, ou o firewall bloqueando 19133-19172 |
+| passo 4 mostra porta efemera (`7FFE` etc) | o `SERVER_UDP_PORTS` nao foi honrado; o gameplay sorteia porta e morre atras de NAT |
+| so da rede local funciona, de fora nao | NAT/ingress do provedor: ajuste o `SERVER_UDP_PORTS` do `.env` para o IP publico e rode `docker compose up -d bds`. **Nao** mexa no `server-ip` (e' bind, e nao valor anunciado) |
 | so funciona local e quebra de novo apos reboot | regra de `iptables` digitada a mao: o cloud-init da OCI reescreve o `INPUT`. Instale o `mine-bedrock-firewall.service` |
 | tudo acima ok e o jogo nao entra | DNS/Cloudflare: o registro tem que ser **cinza** (Cloudflare nao proxya UDP) |
+| `/permitir` diz que liberou e o jogador nao entra | a `allow-list` esta desligada, ou o console do BDS nao respondeu e o bot avisou que a edicao do arquivo e fragil. `/lista` mostra o que o servidor tem carregado |
 
 Duas regras do `server-udp-ports` que valem no BDS 1.26.51+, e que nao dao erro
 quando estao erradas - o servidor sobe e loga `Server started.` normalmente:
@@ -494,7 +550,9 @@ quando estao erradas - o servidor sobe e loga `Server started.` normalmente:
 1. **So funciona 1:1.** `externo` tem que ser igual a `interno`
    (`19133-19172:19133-19172` ok; `61226:19133` abre o servidor e nunca escuta).
 2. **Precisa estar no arquivo antes do boot.** O BDS le `server.properties` uma
-   vez so. Mudou la, tem que reiniciar o `bds`.
+   vez so. Mudou la, tem que reiniciar o `bds`. Por isso o valor vem do
+   `SERVER_UDP_PORTS` do `.env`: a imagem escreve antes de todo boot, entao
+   `docker compose up -d bds` ja resolve.
 
 > Nao use `mc-monitor` para diagnosticar: ele faz ping raknet e o nethernet nao
 > responde, entao da erro mesmo com o servidor perfeito. Use o `/v1/join`.

@@ -45,7 +45,7 @@ async def notificar(bot: Bot, ctx: AppContext, texto: str) -> None:
 
 
 async def reconciliador(ctx: AppContext, bot: Bot) -> None:
-    """Reaplica props/allowlist salvas. Corrige drift do boot e atualizacoes."""
+    """Reaplica as props que o boot sobrescreveu. Corrige drift e atualizacoes."""
     while True:
         await asyncio.sleep(60)
         try:

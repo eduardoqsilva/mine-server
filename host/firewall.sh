@@ -13,7 +13,8 @@
 # Idempotente: pode rodar quantas vezes quiser, antes ou depois do docker.
 #   sudo sh /opt/mine-bedrock/firewall.sh
 #
-# As portas sao sobrescritiveis, porque precisam seguir o server-udp-ports:
+# As portas sao sobrescritiveis, porque precisam seguir o SERVER_UDP_PORTS
+# do .env (a faixa que o nethernet anuncia):
 #   TCP_PORTS=19132 UDP_PORTS="19133:19172 7551" sudo -E sh firewall.sh
 set -eu
 
