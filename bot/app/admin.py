@@ -317,33 +317,50 @@ async def _promover_jogador(
     decisao = "declined" if nivel == "visitor" else "approved"
     ctx.store.define_jogador(nome, xuid_real, nivel, decisao)
     ctx.store.audita(quem, "ops", f"{nome}={nivel} xuid={xuid_real}")
+    log.info("solicitando permission reload para xuid=%s nivel=%s", xuid_real, nivel)
     try:
-        erro, linhas = await asyncio.to_thread(ctx.docker.console, "permission reload")
+        erro_reload, linhas_reload = await asyncio.to_thread(
+            ctx.docker.console, "permission reload"
+        )
     except Exception as exc:
         return False, (
             f"Gravei {nome} = {nivel} no permissions.json e no SQLite, mas nao consegui "
             f"recarregar no servidor: {exc}"
         )
-    if erro:
+
+    try:
+        erro_lista, linhas_lista = await asyncio.to_thread(
+            ctx.docker.console, "permission list"
+        )
+    except Exception as exc:
+        return False, (
+            f"Gravei {nome} = {nivel} no permissions.json, mas nao consegui consultar "
+            f"a permissao efetiva no servidor: {exc}"
+        )
+    resposta_lista = " ".join(ops.limpa_resposta("permission list", linhas_lista)).strip()
+    log.info(
+        "permission list para xuid=%s: erro=%s resposta=%s",
+        xuid_real, erro_lista or erro_reload or "nenhum", resposta_lista or "(vazia)",
+    )
+    if erro_lista or not resposta_lista:
         return False, (
             f"Gravei {nome} = {nivel} no permissions.json e no SQLite, mas o servidor "
-            f"recusou permission reload: {erro}"
+            f"nao confirmou permission list: {erro_lista or erro_reload or 'sem resposta'}"
         )
-    resposta_reload = " ".join(ops.limpa_resposta("permission reload", linhas)).strip()
-    if not resposta_reload:
+    estado = resposta_lista.casefold()
+    if xuid_real.casefold() not in estado and nome.casefold() not in estado:
         return False, (
-            f"Gravei {nome} = {nivel} no permissions.json e no SQLite, mas nao recebi "
-            "confirmacao do servidor para permission reload. Verifique /console permission reload."
+            f"Gravei {nome} = {nivel} no permissions.json, mas o XUID nao apareceu "
+            f"em permission list: {resposta_lista}"
         )
-    if any(
-        trecho in resposta_reload.casefold()
-        for trecho in ("unknown command", "syntax error", "permission denied", "failed")
-    ):
+    if nivel.casefold() not in estado:
         return False, (
-            f"Gravei {nome} = {nivel} no permissions.json e no SQLite, mas o servidor "
-            f"reportou falha no reload: {resposta_reload}"
+            f"Gravei {nome} = {nivel} no permissions.json, mas permission list ainda "
+            f"mostra outro nivel: {resposta_lista}"
         )
-    aplicacao = f"BDS: {resposta_reload}"
+    if erro_reload:
+        log.warning("permission reload reportou erro, mas permission list confirmou o estado desejado: %s", erro_reload)
+    aplicacao = f"BDS confirmou {nivel}: {resposta_lista}"
     if mudou:
         aplicacao += "; se ja estava online, desconecte e conecte novamente"
     else:

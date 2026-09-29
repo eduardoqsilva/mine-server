@@ -830,7 +830,7 @@ def test_serverctl() -> None:
 
 
 def test_promocao_confirma_reload() -> None:
-    print("admin: promocao so confirma se permission reload foi aceito")
+    print("admin: promocao so confirma o nivel efetivo do BDS")
 
     class FakeServer:
         def online_mode(self) -> bool:
@@ -850,45 +850,50 @@ def test_promocao_confirma_reload() -> None:
             pass
 
     class FakeDocker:
-        def __init__(self, erro: str, linhas: list[str]) -> None:
-            self.erro = erro
-            self.linhas = linhas
+        def __init__(self) -> None:
+            self.respostas = {
+                "permission reload": ("", []),
+                "permission list": ("", ["2535463291192118: member"]),
+            }
+            self.comandos: list[str] = []
 
         def console(self, comando: str) -> tuple[str, list[str]]:
-            return self.erro, self.linhas
+            self.comandos.append(comando)
+            return self.respostas[comando]
 
     store_fake = FakeStore()
     contexto = SimpleNamespace(
         server=FakeServer(),
         store=store_fake,
-        docker=FakeDocker("send-command recusou: processo do BDS nao encontrado", []),
+        docker=FakeDocker(),
     )
+    contexto.docker.respostas["permission list"] = ("", ["2535463291192118: visitor"])
     sucesso, resposta = asyncio.run(
         admin._promover_jogador(
             contexto, "Eduhqs", "2535463291192118", "member", quem=1, origem="/member"
         )
     )
-    check("reload recusado nao finge sucesso", not sucesso and "recusou permission reload" in resposta, resposta)
+    check("reload silencioso com nivel antigo nao finge sucesso", not sucesso and "mostra outro nivel" in resposta, resposta)
+    check("consultou o estado efetivo no BDS", contexto.docker.comandos == ["permission reload", "permission list"], contexto.docker.comandos)
     check("permissao pretendida fica salva no sqlite", store_fake.jogador == (
         "Eduhqs", "2535463291192118", "member", "approved"
     ), store_fake.jogador)
 
-    contexto.docker.erro = ""
-    contexto.docker.linhas = ["Reloaded permissions from file."]
+    contexto.docker.respostas["permission list"] = ("", ["2535463291192118: member"])
     sucesso, resposta = asyncio.run(
         admin._promover_jogador(
             contexto, "Eduhqs", "2535463291192118", "member", quem=1, origem="/member"
         )
     )
-    check("resposta do BDS confirma promocao", sucesso and "Reloaded permissions" in resposta, resposta)
+    check("reload silencioso e permission list confirmam promocao", sucesso and "BDS confirmou member" in resposta, resposta)
 
-    contexto.docker.linhas = ["permission reload"]
+    contexto.docker.respostas["permission list"] = ("", ["permission list"])
     sucesso, resposta = asyncio.run(
         admin._promover_jogador(
             contexto, "Eduhqs", "2535463291192118", "member", quem=1, origem="/member"
         )
     )
-    check("reload sem resposta nao finge sucesso", not sucesso and "nao recebi confirmacao" in resposta, resposta)
+    check("eco sozinho nao confirma promocao", not sucesso and "nao confirmou permission list" in resposta, resposta)
 
 
 def test_interpreta_config() -> None:
