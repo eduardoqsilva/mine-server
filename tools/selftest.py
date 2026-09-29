@@ -1224,6 +1224,9 @@ def test_allowlist() -> None:
         check("entrou pela lista do servidor", lib.estado == ops.LIBERADO and lib.aviso == "", (lib.estado, lib.aviso))
         check("add foi pelo console", 'allowlist add "Example Name"' in docker.comandos, docker.comandos)
         check("confirmou com allowlist list", "allowlist list" in docker.comandos, docker.comandos)
+        check("mandou allowlist reload", "allowlist reload" in docker.comandos, docker.comandos)
+        depois_do_add = docker.comandos[docker.comandos.index('allowlist add "Example Name"') :]
+        check("reload veio antes do list", depois_do_add.index("allowlist reload") < depois_do_add.index("allowlist list"), depois_do_add)
         check("nome com espaco foi entre aspas", "Example Name" in docker.lista, docker.lista)
         check("arquivo nao foi tocado", json.loads((data / "allowlist.json").read_text(encoding="utf-8")) == [])
 
@@ -1253,6 +1256,121 @@ def test_allowlist() -> None:
         check("fallback fica pendente, nao liberado", lib.estado == ops.LIBERADO_PENDENTE, lib.estado)
         check("fallback avisa que nao vale ainda", "nao vale" in lib.aviso, lib.aviso)
         check("fallback diz o erro do console", "failed to search" in lib.aviso, lib.aviso)
+
+        # --- o console volta no meio: so o reload, sem derrubar o servidor ---
+        # Este e' o caso que a versao anterior tratava como "derruba o servidor
+        # em 5 minutos". A doc do BDS diz que o reload e' o que faz o servidor
+        # pasar a ler o arquivo, entao se ele responde o /permitir acaba aqui -
+        # e o timer deixa de ser o caminho normal.
+        class _RecusaNoAdd(_Console):
+            """O `add` falha (console mal), mas o reload e o list funcionam."""
+
+            def console(self, *args: str, **kwargs) -> tuple[str, list[str]]:
+                bruto = args[0]
+                self.comandos.append(bruto)
+                if bruto.startswith("allowlist add"):
+                    return recusa, []
+                if bruto == "allowlist reload":
+                    self.lista = [n for n in self.lista if n == "Ze"]
+                    self.lista.append("Caio")
+                    return "", []
+                partes = bruto.split(maxsplit=2)
+                comando = partes[1] if len(partes) > 1 and partes[0] == "allowlist" else bruto
+                if comando == "list":
+                    return "", list(self.lista)
+                return "", []
+
+        docker_meio = _RecusaNoAdd(["Ze"])
+        ctx.docker = docker_meio
+        lib = asyncio.run(ops.poe_na_lista(ctx, "Caio"))
+        check("reload sozinho libera, sem reiniciar", lib.estado == ops.LIBERADO, (lib.estado, lib.aviso))
+        check("e o aviso diz que foi sem reiniciar", "sem precisar reiniciar" in lib.aviso, lib.aviso)
+        check("nada foi agendado para reiniciar", st.liberacoes() == [], st.liberacoes())
+
+        # --- modo offline: a lista precisa ser so o nome ---
+        # Sem autenticacao Microsoft o cliente nao tem XUID, e a doc do BDS
+        # deixa o xuid opcional justamente por isso: "if it's not set then it
+        # will be populated when someone with a matching name connects". Com
+        # o campo preenchido, o servidor compara um numero que nunca bate e o
+        # jogador fica de fora mesmo estando na lista.
+        (data / "server.properties").write_text("allow-list=true\nonline-mode=false\n", encoding="utf-8")
+        check("online_mode le desligado", srv.online_mode() is False, srv.le_props())
+        (data / "server.properties").write_text("allow-list=true\n", encoding="utf-8")
+        check("sem a chave, vale o padrao do BDS (true)", srv.online_mode() is True, srv.le_props())
+        (data / "server.properties").write_text("allow-list=true\nonline-mode=false\n", encoding="utf-8")
+
+        (data / "allowlist.json").write_text(
+            json.dumps(
+                [
+                    {"ignoresPlayerLimit": False, "name": "Velha", "xuid": "2535463291192118"},
+                    {"ignoresPlayerLimit": False, "name": "Limpa"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        check("acha a entrada presa por xuid", srv.entradas_com_xuid() == ["Velha"], srv.entradas_com_xuid())
+
+        # O console nao confirma nada, entao o bot cai no arquivo - que e' o
+        # caminho onde o xuid poderia entrar por descuido.
+        ctx.docker = _Mudo([])
+        lib = asyncio.run(ops.poe_na_lista(ctx, "Novo"))
+        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
+        check("offline: entrada nova sem xuid", {"ignoresPlayerLimit": False, "name": "Novo"} in salvos, salvos)
+        check("offline: entrada nova tem o campo do BDS", "ignoresPlayerLimit" in next(e for e in salvos if e["name"] == "Novo"), salvos)
+        check("offline: e nao foi declarada liberada", lib.estado == ops.LIBERADO_PENDENTE, lib.estado)
+
+        # o /permitir com xuid digitado nao pode gravar o numero em modo offline
+        srv.add_allowlist("Digitado", xuid="2535463291192118")
+        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
+        entrada = next(e for e in salvos if e["name"] == "Digitado")
+        check("offline: xuid digitado e' ignorado", "xuid" not in entrada, entrada)
+
+        # online de volta: ai o xuid entra, porque existe. O numero e' outro de
+        # proposito - o add_allowlist deduplica por xuid, e repetir o mesmo
+        # casaria com a entrada da "Velha" em vez de criar uma nova.
+        (data / "server.properties").write_text("allow-list=true\nonline-mode=true\n", encoding="utf-8")
+        srv.add_allowlist("ComXbl", xuid="2535463291192119")
+        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
+        entrada = next(e for e in salvos if e["name"] == "ComXbl")
+        check("online: xuid e' gravado", entrada.get("xuid") == "2535463291192119", entrada)
+
+        # a cura do boot: tira o xuid de tudo quando o servidor nao autentica
+        (data / "server.properties").write_text("allow-list=true\nonline-mode=false\n", encoding="utf-8")
+        docker_cura = _Console([])
+        ctx.docker = docker_cura
+        curados = asyncio.run(ops.cura_offline(ctx))
+        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
+        check("cura tira o xuid de tudo", not any(e.get("xuid") for e in salvos), salvos)
+        check("cura devolve quem mudou", set(curados) >= {"Velha", "ComXbl"}, curados)
+        check("cura manda o reload", "allowlist reload" in docker_cura.comandos, docker_cura.comandos)
+        check("os nomes continuam na lista", {e["name"] for e in salvos} >= {"Velha", "Limpa", "Novo"}, salvos)
+
+        # online ligado: a cura nao existe e nao pode mexer na lista
+        (data / "server.properties").write_text("allow-list=true\nonline-mode=true\n", encoding="utf-8")
+        srv.add_allowlist("Intacta", xuid="2535463291192117")
+        check("online: cura nao age", asyncio.run(ops.cura_offline(ctx)) == [])
+        salvos = json.loads((data / "allowlist.json").read_text(encoding="utf-8"))
+        check("online: xuid continua", any(e.get("xuid") for e in salvos), salvos)
+        # purga_xuids e' a ferramenta crua, sem olhar o online-mode: quem decide
+        # e' cura_offline, que so chama ela com o servidor sem autenticacao.
+        check("purga_xuids tira o que sobrou", sorted(srv.purga_xuids()) == ["Intacta"], srv.allowlist())
+
+        # o /lista precisa apontar a entrada presa, senao o bug fica invisivel
+        (data / "server.properties").write_text("allow-list=true\nonline-mode=true\n", encoding="utf-8")
+        srv.add_allowlist("Presa", xuid="2535463291192116")
+        (data / "server.properties").write_text("allow-list=true\nonline-mode=false\n", encoding="utf-8")
+        ctx.docker = _Console(["Presa"])
+        estado = ops.estado_real(ctx)
+        check("estado_real sabe o online-mode", estado.online_mode is False, estado.online_mode)
+        check("e lista quem esta preso", estado.entradas_presas() == ["Presa"], estado.entradas_presas())
+        (data / "server.properties").write_text("allow-list=true\nonline-mode=true\n", encoding="utf-8")
+        estado = ops.estado_real(ctx)
+        check("online: ninguem e' preso", estado.entradas_presas() == [], estado.entradas_presas())
+        (data / "allowlist.json").write_text("[]\n", encoding="utf-8")
+
+        # Volta ao estado que o resto do bloco espera: lista desligada, e sem
+        # autenticacao, que e' como o compose entrega o servidor.
+        (data / "server.properties").write_text("allow-list=false\nonline-mode=false\n", encoding="utf-8")
 
         # --- console recusado com o servidor PARADO: ai o boot resolve ---
         ctx.docker = _Console([], recusa=recusa, rodando=False)

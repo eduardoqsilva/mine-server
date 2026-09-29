@@ -257,11 +257,27 @@ class EstadoLista:
     allow_list_arquivo: str = ""
     whitelist_antigo: bool = False
     pendentes: list[str] = field(default_factory=list)
+    online_mode: bool = True
 
     @property
     def servidor_consultavel(self) -> bool:
         """Da para perguntar ao servidor o que ele tem?"""
         return not self.erro_console
+
+    def entradas_presas(self) -> list[str]:
+        """Quem esta na lista com xuid enquanto o servidor nao autentica ninguem.
+
+        Sao entradas que o proprio jogador nao consegue destravar: sem conta
+        Microsoft o cliente nao tem XUID, e o servidor casa a entrada por um
+        numero que nunca vai bater. Some com isso e o nome volta a valer.
+        """
+        if self.online_mode:
+            return []
+        return [
+            str(item.get("name", "")).strip()
+            for item in self.entradas_arquivo
+            if item.get("xuid") and str(item.get("name", "")).strip()
+        ]
 
     def tem_no_servidor(self, nome: str) -> bool:
         return confirmado(self.linhas_servidor, nome)
@@ -303,6 +319,7 @@ def estado_real(ctx: AppContext) -> EstadoLista:
         allow_list_arquivo=ctx.server.le_props().get("allow-list", ""),
         whitelist_antigo=ctx.server.tem_whitelist_json(),
         pendentes=[r["name"] for r in ctx.store.liberacoes()],
+        online_mode=ctx.server.online_mode(),
     )
 
 
@@ -315,11 +332,16 @@ class Liberacao:
 async def poe_na_lista(ctx: AppContext, nome: str, xuid: str | None = None) -> Liberacao:
     """Coloca o jogador na allow-list. Devolve em que estado ela ficou.
 
-    O console vem primeiro porque o 'allowlist add' e' o caminho que sobrevive:
-    o BDS resolve o XUID, grava o arquivo no formato dele e ja passa a valer
-    para o servidor que esta rodando. O arquivo so e' tocado quando o console
-    nao entrega o nome, e nesse caso a entrada so vale no proximo boot - ou,
-    com o BDS rodando, depois do reinicio que o /permitir agenda.
+    A ordem e' add -> reload -> list, e o meio dela e' o que faz a diferenca.
+    A doc do BDS descreve o `add` como mexer no *arquivo*, e so o `reload` como
+    o comando que "makes the server reload the allowlist from the file" - sem
+    ele a edicao fica no disco esperando um boot. Antes desta ordem, todo
+    `/permitir` que caia no caminho de arquivo acabava em LIBERADO_PENDENTE e
+    derrubava o servidor 5 minutos depois para um reload que cabe em um comando.
+
+    O console vem primeiro porque o `allowlist add` e' o caminho que sobrevive:
+    o BDS grava a lista no formato dele. O arquivo so e' tocado quando o console
+    nao entrega o nome, e nesse caso um reload resolve - o boot, nao.
 
     Devolve sempre um estado, nunca um "ok" vago: a diferenca entre LIBERADO e
     LIBERADO_PENDENTE e exatamente a diferenca entre o jogador entrar agora e o
@@ -327,6 +349,11 @@ async def poe_na_lista(ctx: AppContext, nome: str, xuid: str | None = None) -> L
     """
     erro, _linhas = await asyncio.to_thread(allowlist_no_console, ctx, "add", serverctl.cita(nome))
     if not erro:
+        # O reload vai sempre depois do add, mesmo quando o console ja pareceu
+        # aceitar. E' de graca (o comando e' silencioso) e cobre o caso em que o
+        # add so gravou o arquivo, que e' o unico jeito de o bot dizer
+        # "liberado" sem restart.
+        await asyncio.to_thread(allowlist_no_console, ctx, "reload")
         _e, listadas = await asyncio.to_thread(allowlist_no_console, ctx, "list")
         if confirmado(listadas, nome):
             return Liberacao(LIBERADO)
@@ -349,16 +376,40 @@ async def poe_na_lista(ctx: AppContext, nome: str, xuid: str | None = None) -> L
     return await _so_no_arquivo(ctx, nome, xuid, erro, "o console nao respondeu")
 
 
+async def cura_offline(ctx: AppContext) -> list[str]:
+    """Deixa a lista usavel sem conta Microsoft. Devolve quem foi corrigido.
+
+    So age com `online-mode` desligado, e mesmo assim so tira xuid: com
+    autenticacao o campo e' preenchido pelo servidor e o nome continua valendo.
+    Sem essa cura, um allowlist.json herdado de quando o servidor exigia conta
+    fica com o dono trancado fora do proprio servidor, sem erro nenhum - que e
+    o pior tipo de bug, o que so aparece quando alguem tenta entrar.
+    """
+    if await asyncio.to_thread(ctx.server.online_mode):
+        return []
+    mudados = await asyncio.to_thread(ctx.server.purga_xuids)
+    if mudados:
+        await asyncio.to_thread(allowlist_no_console, ctx, "reload")
+    return mudados
+
+
 async def _so_no_arquivo(
     ctx: AppContext, nome: str, xuid: str | None, erro: str, explicacao: str
 ) -> Liberacao:
-    """    O console nao serviu: grava no arquivo e diz se isso chega a valer.
+    """O console nao serviu: grava no arquivo, manda o reload e confere.
 
-    O detalhe que muda tudo: se o BDS esta PARADO, o proximo boot le o arquivo e
-    a entrada entra na memoria dele - ai funciona. Se o BDS esta RODANDO, so
-    reiniciar faz a entrada valer, porque o stop reescreve o arquivo a partir
-    da lista velha e leva a edicao junto - e e por isso que o /permitir agenda o
-    reinicio em vez de so avisar.
+    Este era o caminho que agendava o reinicio sempre, e a ideia era razoavel
+    enquanto se acreditava que so o boot lia o arquivo. A doc do BDS diz o
+    contrario: "After you've modified the file you need to run the command
+    allowlist reload to make sure that the server knows about your new change".
+    Entao aqui tambem vale a sequencia arquivo -> reload -> list, e o
+    LIBERADO_PENDENTE (que derruba o servidor) sobra so para o caso em que o
+    proprio reload nao pega - que e' o console mudo de verdade, e nao um
+    detalhe de formatacao.
+
+    O que sobra do agendamento e o motivo de o timer continuar existindo: se o
+    console nao responde nem para receber o reload, nao ha caminho curto, e o
+    boot le o arquivo com certeza.
     """
     try:
         await asyncio.to_thread(ctx.server.add_allowlist, nome, xuid)
@@ -367,8 +418,18 @@ async def _so_no_arquivo(
         # nao ha o que o boot ler, e o bot nao pode marcar pendencia que ele
         # mesmo nao vai conseguir cumprir.
         return Liberacao(LIBERADO_FALHOU, f"Nao consegui gravar no allowlist.json: {exc}")
-    if erro:
-        await asyncio.to_thread(allowlist_no_console, ctx, "reload")
+
+    # O reload vai sempre, e nao so quando o console errou: mesmo tendo saido
+    # limpo do `add`, o que o servidor tem em memoria pode ser a lista velha.
+    erro_reload, _l = await asyncio.to_thread(allowlist_no_console, ctx, "reload")
+    if not erro_reload:
+        _e, listadas = await asyncio.to_thread(allowlist_no_console, ctx, "list")
+        if confirmado(listadas, nome):
+            return Liberacao(
+                LIBERADO,
+                "O console nao respondeu bem, entao gravei no allowlist.json e mandei o "
+                "'allowlist reload': o servidor ja esta com a lista nova, sem precisar reiniciar.",
+            )
 
     try:
         rodando = ctx.docker.state().running
@@ -381,8 +442,9 @@ async def _so_no_arquivo(
         )
     return Liberacao(
         LIBERADO_PENDENTE,
-        f"Gravei no allowlist.json, mas {explicacao} ({erro}) e o servidor esta rodando: enquanto "
-        "isso a entrada nao vale, porque ele consulta a lista que tem em memoria.",
+        f"Gravei no allowlist.json, mas nem o reload pegou ({explicacao}: {erro or erro_reload}) e o "
+        "servidor esta rodando: enquanto isso a entrada nao vale, porque ele consulta a lista que tem "
+        "em memoria. Vou reiniciar em instantes para o boot ler o arquivo.",
     )
 
 

@@ -103,7 +103,17 @@ CATALOGO: tuple[Prop, ...] = (
             "pasta do mundo, que o nome so passa a valer no boot seguinte)"
         ),
     ),
-    Prop("online-mode", "Autenticacao Microsoft", "bool", cuidado="desligar quebra o permissions.json (precisa de XUID)"),
+    Prop(
+        "online-mode",
+        "Autenticacao Microsoft",
+        "bool",
+        cuidado=(
+            "o ONLINE_MODE do .env manda nesta: a imagem reescreve em todo boot, entao "
+            "mudar aqui so vale ate o proximo restart. E' o que mantem o servidor "
+            "aberto pra quem nao tem conta Microsoft - e o preco e o permissions.json "
+            "(/ops), que casa por XUID e so existe com autenticacao"
+        ),
+    ),
     Prop(
         "server-udp-ports",
         "Faixa UDP do nethernet",
@@ -123,13 +133,19 @@ CATALOGO: tuple[Prop, ...] = (
 
 POR_CHAVE = {p.key: p for p in CATALOGO}
 
-# Propriedades em que quem manda e o compose. Sao as duas que o entry script
-# precisa ler do ambiente para funcionar (o nome da pasta do mundo e o
-# endereco anunciado do nethernet), entao a imagem as escreve no
-# server.properties em todo boot. Um override do bot aqui seria um
-# alinhamento impossivel: o reconciliador escreveria a cada 60s e o boot
-# seguinte desfaria.
-DO_COMPOSE: frozenset[str] = frozenset({"level-name", "server-udp-ports"})
+# Propriedades em que quem manda e o compose. Sao as que o entry script precisa
+# ler do ambiente para funcionar (o nome da pasta do mundo, o endereco
+# anunciado do nethernet e o modo de autenticacao), entao a imagem as escreve no
+# server.properties em todo boot. Um override do bot aqui seria um alinhamento
+# impossivel: o reconciliador escreveria a cada 60s e o boot seguinte desfaria.
+#
+# Vale notar o que NAO esta aqui: allow-list. A imagem tambem sabe escreve-la
+# (ALLOW_LIST), mas enquanto ninguem definir essa variavel o entry script nao
+# toca na propriedade, e o bot continua sendo o dono dela - e o dono do
+# allowlist.json. Definir ALLOW_LIST ou ALLOW_LIST_USERS no .env faz a imagem
+# sobrescrever o allowlist.json inteiro em todo boot, e o /permitir volta a ser
+# um comando que o BDS desfaz sozinho.
+DO_COMPOSE: frozenset[str] = frozenset({"level-name", "server-udp-ports", "online-mode"})
 
 
 def do_compose(chave: str) -> bool:
@@ -367,15 +383,27 @@ class ServerControl:
         """
         return self.whitelist_path.is_file()
 
+    def online_mode(self) -> bool:
+        """O servidor exige autenticacao Microsoft? (padrao do BDS: sim)
+
+        Importa mais do que parece, porque e' o que decide se a allowlist pode
+        carregar xuid. A doc do BDS e' explicita: o permissions.json "needs
+        online-mode to be enabled since xuid requires online verification of the
+        user account", e o mesmo XUID e' a chave com que a allowlist casa o
+        jogador. Sem autenticacao o cliente nao tem XUID, e uma entrada com o
+        campo preenchido vira um numero que nunca vai bater com ninguem.
+        """
+        return self.le_props().get("online-mode", "true").strip().lower() == "true"
+
     def corrige_xuid(self, nome: str) -> bool:
         """Tira o XUID de uma entrada para o servidor resolver de novo.
 
-        Um XUID gravado e' definitivo: o BDS valida a entrada por ele e nunca
-        re-resolve sozinho, entao um numero errado (ou de um gamertag que foi
-        redefinido) tranca o jogador para sempre - o sintoma e o "voce nao esta
-        na allow-list" de quem esta na lista. A saida e deixar o campo de fora:
-        a doc diz que o XUID "will be resolved the first time the player
-        connects", que e' exatamente o que a gente quer.
+        Entrada com xuid e' definitiva demais: a doc diz que o campo ausente
+        "will be populated when someone with a matching name connects", ou
+        seja, o nome sozinho ja e caminho valido e e o unico que funciona sem
+        autenticacao Microsoft. O sintoma de um xuid errado e o pior possivel
+        - "voce nao esta na allow-list" de quem esta na lista, sem pista de
+        porque.
 
         Devolve True se a entrada existia com XUID e ele foi removido.
         """
@@ -391,6 +419,29 @@ class ServerControl:
             self._salva_lista(self.allowlist_path, dados)
         return mudou
 
+    def purga_xuids(self) -> list[str]:
+        """Tira o xuid de toda a lista. Devolve os nomes que mudaram.
+
+        E' a cura de quem roda com online-mode=false: entrada com xuid nao
+        trava so quem entra pela ultima vez, ela trava o dono da lista tambem,
+        porque a lista so e reescrita com o nome quando alguem entra. Chamar
+        isso no boot garante que um arquivo herdado de quando o servidor
+        exigia conta nao vire um no-op eterno.
+        """
+        dados = self.allowlist()
+        mudados: list[str] = []
+        for item in dados:
+            nome = str(item.get("name", ""))
+            if item.pop("xuid", None) and nome:
+                mudados.append(nome)
+        if mudados:
+            self._salva_lista(self.allowlist_path, dados)
+        return mudados
+
+    def entradas_com_xuid(self) -> list[str]:
+        """Nomes da lista que ainda carregam xuid (o que trava em modo offline)."""
+        return [str(i.get("name", "")) for i in self.allowlist() if i.get("xuid")]
+
     def permissoes(self) -> list[dict]:
         return self._lista(self.permissions_path)
 
@@ -402,12 +453,17 @@ class ServerControl:
         no formato dele. Isto aqui so serve quando o console nao responde
         (Docker Desktop), e ai o arquivo precisa mudar na mao.
 
-        O XUID e opcional de proposito, nao por preguiça: a doc do BDS diz que
+        O XUID e' opcional de proposito, nao por preguiça: a doc do BDS diz que
         "if it's not set then it will be populated when someone with a matching
         name connects". Exigir o numero aqui barraria exatamente quem nunca
         conseguiu entrar, que e quem precisa da permissao - e o XUID adivinhado
         no log, quando errado, e pior do que nenhum: o BDS valida a entrada por
         ele.
+
+        Sem autenticacao Microsoft o XUID nem existe, e por isso o `log_txt`
+        so entra no arquivo quando `online-mode` esta ligado. Gravar o numero
+        com o servidor em modo offline nao e perder a entrada: e gravar uma
+        entrada que o servidor nao vai conseguir casar com ninguem.
 
         Um XUID que ja esta na entrada nunca e trocado. Quem preenche a lista e
         o proprio BDS, nao a gente; se o numero informado divergir do que o
@@ -415,7 +471,11 @@ class ServerControl:
         """
         dados = self.allowlist()
         alvo = nome.lower()
-        if xuid is None and log_txt is not None:
+        if not self.online_mode():
+            # Nem procura no log nem guarda: sem autenticacao o numero viria
+            # de uma conta que o servidor nunca vai ver.
+            xuid = None
+        elif xuid is None and log_txt is not None:
             xuid = self.xuid_no_log(nome, log_txt)
 
         for item in dados:

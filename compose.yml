@@ -40,6 +40,25 @@ services:
       #
       # Nos dois o bot avisa no /config da chave e nao guarda override: um
       # override aqui seria reescrito no boot seguinte de qualquer jeito.
+      # OFF de proposito, e e o padrao do projeto. E' o que deixa o servidor
+      # aberto pra quem joga sem conta Microsoft: sem autenticacao o cliente
+      # nao tem XUID, e por isso a allowlist guarda SO o gamertag (o /permitir
+      # ignora xuid nesse modo - com o campo preenchido a entrada nunca casa).
+      #
+      # O preco: o /ops (permissions.json) casa por XUID verificado, entao com
+      # o online-mode desligado ele nao tem como funcionar. Se precisar de op,
+      # ligue com ONLINE_MODE=true no .env e reinicie.
+      #
+      # Quem manda nesta e' o .env, nao o /config do bot: a imagem reescreve
+      # server.properties em todo boot (o ONLINE_MODE esta no
+      # bds-property-definitions.json da imagem), entao valor gravado aqui
+      # seria desfeito no restart seguinte.
+      ONLINE_MODE: "${ONLINE_MODE:-false}"
+      # Nao defina ALLOW_LIST, ALLOW_LIST_USERS, OPS, MEMBERS nem VISITORS aqui.
+      # A imagem sabe escrever allow-list e o permissions.json inteiro a cada
+      # boot a partir dessas variaveis, e sobrescreveriam o trabalho do bot:
+      # o /permitir passaria a ser um comando que o entrypoint desfaz. Quem
+      # cuida da lista e do allow-list e' o bot.
       LEVEL_NAME: "${LEVEL_NAME:-world}"
       # Atras de NAT (que e o caso de quase toda VPS publica) o nethernet
       # anuncia o IP privado da interface, que ninguem de fora alcanca, e o

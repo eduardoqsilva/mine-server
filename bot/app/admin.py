@@ -41,11 +41,13 @@ AJUDA_ADMIN = "\n".join(
             [
                 "/lista  - quem pode entrar (o que o servidor tem, o que so esta no arquivo)",
                 "/permitir <gamertag>  - adiciona na lista, sem precisar de xuid",
-                "  se o console nao responder, eu marco como pendente e reinicio sozinho",
+                "  se o console nao responder, eu mando o reload; se nem isso pegar, marco como",
+                "  pendente e reinicio sozinho",
                 "/removerjogador <gamertag>  - tira da lista",
                 "/negar <gamertag> [motivo]  - tira da lista e expulsa se estiver online",
                 "/permitido <gamertag>  - volta a liberar",
                 "/ops <gamertag> <operator|member|visitor> [xuid]  - permissoes do jogador",
+                "  so funciona com online-mode ligado: o permissions.json casa por xuid",
                 "/chutar <gamertag> [motivo]  - expulsa agora",
             ]
         ),
@@ -368,7 +370,9 @@ async def cmd_lista(message: Message, ctx: AppContext) -> None:
             txt.sub(["esta gente NAO entra: o BDS consulta a lista que tem em memoria"]),
         ]
         linhas += [txt.sub([f"• {nome}"]) for nome in so_arquivo]
-        linhas.append(txt.sub(["so reiniciar faz o arquivo virar lista: /permitir de novo, ou o botao"]))
+        linhas.append(
+            txt.sub(["um 'allowlist reload' resolve sem derrubar o servidor: /permitir de novo faz isso"])
+        )
     if estado.whitelist_antigo:
         linhas += [
             "",
@@ -397,11 +401,29 @@ async def cmd_lista(message: Message, ctx: AppContext) -> None:
     elif estado.entradas_arquivo:
         for item in estado.entradas_arquivo:
             xuid = item.get("xuid")
-            linhas.append(
-                txt.sub([f"{item.get('name', '?')}" + (f"  (xuid {xuid})" if xuid else "  (sem xuid ainda)")])
-            )
+            preso = xuid and not estado.online_mode
+            if preso:
+                rotulo = "  (PRESO: xuid com online-mode desligado - nunca vai casar)"
+            elif xuid:
+                rotulo = f"  (xuid {xuid})"
+            else:
+                rotulo = "  (so o nome)"
+            linhas.append(txt.sub([f"{item.get('name', '?')}{rotulo}"]))
     else:
         linhas.append(txt.sub(["(ninguem ainda)"]))
+
+    presas = estado.entradas_presas()
+    if presas:
+        linhas += [
+            "",
+            txt.aviso(
+                "online-mode esta DESLIGADO, e estas entradas ainda tem xuid: "
+                + ", ".join(presas)
+                + ". Sem autenticacao o cliente nao tem XUID, entao o servidor compara um numero que "
+                "nunca vai bater e o jogador fica de fora mesmo estando na lista. O bot tira o campo no "
+                "boot; para mandar agora, /permitir de novo."
+            ),
+        ]
 
     if pendentes:
         linhas.append(txt.secao("⏳", "liberacoes pendentes", len(pendentes)))
@@ -451,10 +473,18 @@ async def cmd_permitir(message: Message, command: CommandObject, ctx: AppContext
     # vez de liberar.
     ctx.store.audita(message.from_user.id, "permitir", nome)
 
-    liberacao = await ops.poe_na_lista(ctx, nome, xuid)
+    sem_xbl = not ctx.server.online_mode()
+    liberacao = await ops.poe_na_lista(ctx, nome, None if sem_xbl else xuid)
     lista = await ops.liga_a_lista(ctx, message.from_user.id)
 
     corpo = [txt.cabecalho("👥", "liberar jogador"), "", txt.campo("Nome", nome), ""]
+    if sem_xbl:
+        aviso_offline = (
+            "online-mode desligado: o jogador entra sem conta Microsoft e a lista guarda "
+            "so o gamertag, que e' o que o servidor consegue casar."
+        )
+        corpo.append(txt.sub([aviso_offline]))
+        corpo.append("")
     teclado = None
     if liberacao.estado == ops.LIBERADO:
         corpo.append(txt.ok(f"{nome} esta na lista que o servidor tem carregada. Pode entrar."))
@@ -603,6 +633,32 @@ async def cmd_ops(message: Message, command: CommandObject, ctx: AppContext) -> 
         return
     nome, nivel = args[0], args[1].lower()
     xuid = args[2] if len(args) > 2 else None
+    # Sem autenticacao nao existe xuid, e o permissions.json e' uma lista de
+    # xuid. Melhor recusar dizendo por que do que aceitar e nao surtir efeito.
+    if not ctx.server.online_mode():
+        motivo_ops = (
+            'A doc do BDS e' " explicita: online-mode precisa estar ligado para o "
+            "permissions.json funcionar, porque o xuid exige verificacao online da conta."
+        )
+        await message.answer(
+            "\n".join(
+                [
+                    txt.cabecalho("👤", "/ops precisa de autenticacao"),
+                    "",
+                    txt.erro("O online-mode esta desligado, entao nao existe xuid para casar."),
+                    "",
+                    txt.sub([motivo_ops]),
+                    "",
+                    txt.info("Se quiser op, ponha no .env:"),
+                    txt.sub(["ONLINE_MODE=true"]),
+                    txt.info("e recrie o container, porque a propriedade vive no bds:"),
+                    txt.sub(["docker compose up -d bds"]),
+                    "",
+                    txt.info("A allow-list funciona offline. So o /ops que nao."),
+                ]
+            )
+        )
+        return
     if xuid is None:
         log_txt = ctx.docker.logs(lines=1500)
         xuid = ctx.server.xuid_no_log(nome, log_txt)

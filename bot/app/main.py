@@ -245,6 +245,18 @@ async def main() -> None:
     # downtime volta a contar. A pendencia esta no bot.db justamente para isso -
     # a task em si morreu com o container anterior.
     ops.rearma_pendencia(ctx, bot)
+    # Self-heal da lista antes de qualquer admin poder usar o /permitir: num
+    # servidor sem autenticacao Microsoft, uma entrada com xuid herdada de
+    # quando exigia conta trava o jogador sem erro nenhum. Roda aqui, no boot.
+    try:
+        curados = await ops.cura_offline(ctx)
+    except Exception:
+        # A cura e' melhoria, nao condicao de boot: se ela falhar o bot ainda
+        # serve, e o /lista mostra quem ficou preso.
+        log.exception("falha ao curar a allowlist para modo offline")
+        curados = []
+    if curados:
+        log.info("allowlist sem xuid (online-mode desligado): %s", ", ".join(curados))
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         if admins:

@@ -47,7 +47,8 @@ No `.env`:
 | `LEVEL_NAME` | nome da pasta do mundo em `data/worlds/` (so o 1o boot usa) |
 | `UPDATE_HOUR` / `UPDATE_MINUTE` | horario do restart diario (padrao 05:00) |
 | `BOOT_TIMEOUT` | segundos que o bot espera o jogo subir (padrao 240) |
-| `ALLOWLIST_GRACE_SECONDS` | quanto tempo o `/permitir` espera antes de reiniciar sozinho para a liberação valer (padrao 300, `0` desliga) |
+| `ALLOWLIST_GRACE_SECONDS` | último recurso: quanto tempo o `/permitir` espera antes de reiniciar sozinho quando nem o `allowlist reload` pega (padrao 300, `0` desliga) |
+| `ONLINE_MODE` | autenticacao Microsoft no BDS (padrao `false`: entra sem conta; o preco e o `/ops`) |
 | `BACKUP_KEEP` | versoes antigas guardadas de cada pack (padrao 3) |
 
 Gere o codigo de resgate com `openssl rand -hex 6` e **guarde**: ele e a senha do
@@ -383,38 +384,45 @@ responde "o console nao devolveu nada" — isso e o comando funcionando, nao
 falha. Para derrubar o servidor use `/reiniciar`, que avisa o jogo antes.
 
 **Sobre a allow-list.** Quem manda no `/permitir` é o console do BDS, e não o
-arquivo. O comando é `allowlist add <gamertag>`, e ele faz três coisas de uma
-vez: resolve o XUID na primeira conexão do jogador, grava o `allowlist.json` no
-formato do próprio servidor e já vale para o BDS que está rodando. Sem
-reiniciar.
+arquivo. O comando é `allowlist add <gamertag>` e ele grava o `allowlist.json` no
+formato do próprio servidor.
 
-Isso não é preciosismo. O BDS **reescreve o `allowlist.json` quando desliga**,
-a partir da lista que tem em memória. Quem escreve no arquivo sem o servidor
-saber — porque o `allowlist reload` não chegou, ou o console nem existe — tem a
-entrada apagada no próximo stop. É o "adicionei a pessoa e ela sumiu da lista
-depois de um restart", e é por isso que o bot não aceita mais um
-"pronto" sem conferir: ele roda `allowlist list` depois do `add` e só diz que
-liberou se o nome aparecer na resposta.
+O bot nunca acredita que o `add` bastou. A sequência é **`add` → `reload` →
+`list`**, e só diz "liberado" se o nome aparecer no `allowlist list`. O meio
+dessa sequência é o que a doc do BDS manda fazer e o código anterior ignorava:
+
+> *"After you've modified the file you need to run the command `allowlist reload`
+> to make sure that the server knows about your new change."*
+
+Ou seja: **editar o arquivo não precisa de reinício**, só de `allowlist reload`.
+O `allowlist add` documentado pelo Mojang é descrito como mexer no *arquivo*, e
+só o `reload` é o comando que "makes the server reload the allowlist from the
+file". Sem ele, o `/permitir` acabava pendurado esperando um boot.
+
+Isso continua não sendo preciosismo pelos dois motivos do resto do texto: o BDS
+**reescreve o `allowlist.json` quando desliga**, a partir da lista que tem em
+memória; e o `add` sozinho não é atestado de nada.
 
 Quando o console não responde (é o caso do Docker Desktop no Windows, onde o
-`send-command` não acha o processo do BDS), o bot grava no `allowlist.json` — e
-aí a resposta honesta depende do estado do servidor:
+`send-command` não acha o processo do BDS), o bot grava no `allowlist.json` e
+manda o `reload`. Aí a resposta honesta depende do estado do servidor:
 
+- **`reload` pegou e o nome apareceu** — liberado, sem reiniciar. É o caminho
+  normal agora.
 - **BDS parado** — funciona. O próximo boot lê o arquivo, a entrada entra na
   memória dele, e a partir daí quem mantém a lista é o próprio BDS.
-- **BDS rodando** — a entrada **ainda não vale**. O BDS consulta a lista que tem
-  em memória, e o próximo `stop` reescreve o arquivo a partir dela, levando a
-  edição junto.
+- **Nem o `reload` pegou, com o BDS rodando** — a entrada **ainda não vale**. O
+  BDS consulta a lista que tem em memória, e o próximo `stop` reescreve o arquivo
+  a partir dela, levando a edição junto.
 
-No segundo caso o bot não para aí. O `/permitir` marca a liberação como
-**pendente** e avisa que vai reiniciar sozinho em `ALLOWLIST_GRACE_SECONDS`
-(5 minutos por padrão) para fazer a entrada valer de verdade. A mensagem no
-Telegram mostra o horário exato, e a pendência fica no `bot.db`: um
-`docker compose restart` do bot no meio da espera não cancela a promessa, o bot
-rearma o prazo no boot seguinte. O botão **"⏩ Reiniciar agora e liberar"** só
-antecipa o que ia acontecer sozinho; **"Cancelar"** desfaz. Com
-`ALLOWLIST_GRACE_SECONDS=0` o automático é desligado e a decisão volta para a
-sua mão.
+Só no último caso o bot marca a liberação como **pendente** e avisa que vai
+reiniciar sozinho em `ALLOWLIST_GRACE_SECONDS` (5 minutos por padrão). É o resto
+de segurança, não o caminho comum. A mensagem no Telegram mostra o horário exato,
+e a pendência fica no `bot.db`: um `docker compose restart` do bot no meio da
+espera não cancela a promessa, o bot rearma o prazo no boot seguinte. O botão
+**"⏩ Reiniciar agora e liberar"** só antecipa o que ia acontecer sozinho;
+**"Cancelar"** desfaz. Com `ALLOWLIST_GRACE_SECONDS=0` o automático é desligado e
+a decisão volta para a sua mão.
 
 O reinício acontece na única ordem que faz a entrada sobreviver: o bot **para**
 o servidor (é o `stop` que para de reescrever o `allowlist.json`), grava
@@ -424,9 +432,59 @@ lista para a memória do BDS. Antes de derrubar qualquer coisa ele pergunta
 reinício é cancelado e o downtime é zero.
 
 Se o `allowlist add` é aceito mas o nome não aparece no `allowlist list`, quase
-sempre é uma entrada antiga presa num XUID: o BDS valida a entrada por ele e não
-re-resolve o nome. O bot tira o campo, manda `allowlist reload` e tenta de novo
-antes de dizer que falhou.
+sempre é uma entrada antiga presa num XUID: o BDS casa a entrada por ele. O bot
+tira o campo, manda `allowlist reload` e tenta de novo antes de dizer que falhou.
+
+### Jogar sem conta Microsoft
+
+O projeto roda com `ONLINE_MODE=false` por padrão: **não é preciso ter conta
+Microsoft para entrar no servidor**. Essa é a única coisa que o `online-mode`
+desligado entrega, e ela tem uma consequência que precisa ser dita com todas as
+letras.
+
+O XUID é a identidade que o Xbox Live entrega na autenticação. Sem ela o cliente
+não tem XUID nenhum, e a allow-list é uma lista de registros `{name, xuid}` em que
+o servidor casa o jogador pelo XUID. Entrada **sem** `xuid` funciona — a doc
+garante que ele "will be populated when someone with a matching name connects" — e
+entrada **com** `xuid` é o problema: o servidor compara um número que nunca vai
+bater com o cliente anônimo, e o jogador fica de fora **estando na lista**, sem
+erro nenhum no console para explicar.
+
+Por isso, com `online-mode` desligado o bot nunca grava XUID: o `/permitir`
+ignora o número que você digitar, o `/lista` marca as entradas que ainda têm
+`xuid` como **PRESO**, e o bot tira o campo de todas elas no boot (a cura, que
+resolve o `allowlist.json` herdado de quando o servidor exigia conta).
+
+O que **não** funciona desligado é o `/ops`. O `permissions.json` é uma lista de
+XUIDs e a doc é explícita: *"online-mode needs to be enabled for this feature to
+work since xuid requires online verification of the user account"*. Não é bug do
+bot, é o desenho do recurso. Se precisar de op, ponha `ONLINE_MODE=true` no `.env`
+e reinicie o container — e aí o `/permitir` volta a gravar XUID.
+
+E o `/negar` continua valendo, que é a parte que você usa no dia a dia: com a
+allow-list ligada, negar a alguém bloqueia o acesso de verdade.
+
+> Nenhum jogador precisa estar no `allowlist.json` para o servidor funcionar, mas
+> vale saber que **sem autenticação não existe identidade verificada**: com
+> `online-mode=false` o `allow-list` decide por gamertag, e gamertag não é
+> segredo. Quem quiser jogar tem que estar na lista; quem quiser *parecer* outra
+> pessoa é outra história.
+
+### Não declarar estas variáveis no `.env`
+
+A imagem `itzg/minecraft-bedrock-server` reescreve arquivos inteiros a cada boot a
+partir de variáveis de ambiente, e duas delas colidem frontalmente com o bot:
+
+| Variável | O que a imagem faz | Consequência |
+| --- | --- | --- |
+| `ALLOW_LIST` | escreve `allow-list` no `server.properties` | o `/config` do bot é desfeito no boot |
+| `ALLOW_LIST_USERS` | **sobrescreve o `allowlist.json` inteiro** | todo `/permitir` é apagado no restart seguinte |
+| `OPS`, `MEMBERS`, `VISITORS` | **sobrescreve o `permissions.json` inteiro** | todo `/ops` é apagado no restart seguinte |
+
+Quem cuida da lista e do `allow-list` é o bot, justamente porque a lista muda a
+cada `/permitir`. Declarar essas variáveis transforma o bot num comando que o
+entrypoint desfaz sozinho. `ONLINE_MODE` é a exceção: ela está no compose de
+propósito, porque é a única dessas cujo valor é fixo e não muda com o `/permitir`.
 
 Detalhe que derruba tudo se for ignorado: se existir um `/data/whitelist.json`,
 ele tem **preferência** sobre o `allowlist.json` e continua mandando na lista,
@@ -437,8 +495,9 @@ O `xuid` virou opcional de propósito. A doc do BDS é explícita: *"you don't
 need to specify a XUID here, it will be resolved the first time the player
 connects"*. Exigir o número barrava exatamente quem nunca conseguiu entrar — que
 é quem precisa da permissão — e o número adivinhado no log, quando errado, é
-pior do que nenhum, porque o BDS valida a entrada por ele. Se quiser passar o
-número mesmo, `/permitir <gamertag> <xuid>` ainda aceita.
+pior do que nenhum, porque o BDS casa a entrada por ele. Se quiser passar o
+número mesmo, `/permitir <gamertag> <xuid>` ainda aceita — e é ignorado, com
+aviso, quando o `online-mode` está desligado, porque ali o número não existe.
 
 A `allow-list` do `server.properties` é lida **só no boot**, então o `/permitir`
 manda `allowlist on` (que liga em runtime) e grava `allow-list=true` no arquivo
