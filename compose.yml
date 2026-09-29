@@ -54,15 +54,33 @@ services:
       # abaixo cobre o caso do SIGKILL.
       STOP_SERVER_ANNOUNCE_DELAY: "0"
       OPS: "${OPS:-}"
-    ports:
-      # Sem proxy na frente: o container publica direto no host. Com
-      # transport=nethernet sao duas portas, porque o protocolo tem duas etapas:
-      #   - TCP 19132    signalling HTTP, o handshake em si
-      #   - UDP 19133-72 gameplay WebRTC, faixa fixada por server-udp-ports
-      # A faixa UDP tem que bater com a do data/server.properties
-      # (server-udp-ports=19133-19172:19133-19172).
-      - "19132:19132/tcp"
-      - "19133-19172:19133-19172/udp"
+      # So se a rede host NAO bastar (NAT do provedor sem porta fixa, ou
+      # servidor com mais de um IP). Fixa o IP que o nethernet anuncia como
+      # candidato, e' o que o cliente tenta. Vazio = o BDS escolhe sozinho a
+      # partir das interfaces do host, que e' o certo na maioria dos casos.
+      # Custo: com o IP fixado, quem estiver na mesma LAN deixa de entrar.
+      SERVER_IP: "${SERVER_IP:-}"
+    network_mode: host
+    # SEM bloco `ports:` de proposito. O nethernet (BDS 1.26.51+) nao e so
+    # "abrir a porta": o servidor sorteia os candidatos ICE a partir das
+    # interfaces que ele enxerga e anuncia um deles via serviço de signalling
+    # da Mojang. Em rede bridge ele enxerga a interface do container
+    # (172.x.x.x) e anuncia isso - um endereco que o cliente da internet nao
+    # alcanca. Da no sintoma classico: signalling responde (/v1/join devolve
+    # JSON), o server aparece na lista, e a conexao morre em "Door" /
+    # InitialConnection sem evento nenhum no console do BDS.
+    #
+    # Nao ha solucao por `ports:`: publicar porta nao corrige o endereco
+    # anunciado. Todo config que funciona com esse transporte usa rede host.
+    #
+    # Consequencias no host (a firewall e a sua):
+    #   - TCP 19132   signalling HTTP (e o /v1/join, que o healthcheck usa)
+    #   - UDP 7551    porta fixa do NetherNet, aberta em qualquer config
+    #   - UDP 19133-72 gameplay WebRTC, a faixa de server-udp-ports
+    #
+    # O bds escuta direto na interface do host, entao o `ports:` e' ignorado
+    # (o Docker ainda avisa no `up`). Aponte o DNS/Cloudflare para TCP 19132
+    # e deixe o record em cinza: Cloudflare so proxya TCP, nao UDP.
     volumes:
       - ./data:/data
       # O BDS ignora este arquivo (Bedrock nao tem icone de servidor proprio),
@@ -85,7 +103,16 @@ services:
       TZ: "${TZ:-America/Sao_Paulo}"
       BDS_CONTAINER: "mine-bedrock"
       BDS_DATA_DIR: "/data"
+      # O bds esta em network_mode: host, entao ele some da rede bridge e o
+      # nome "mine-bedrock" deixa de resolver daqui. O ping so do /status e
+      # do watchdog apontam para o IP do host, que e onde a 19132 esta
+      # escutando agora. No nethernet o unconnected ping nunca responde mesmo
+      # (o BDS nao binda UDP na 19132), entao isso e' so para o erro do
+      # watchdog ser honesto em vez de "no such host".
+      BDS_HOST: "host.docker.internal"
       STATE_DIR: "/state"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/data
       # /state: o bot.db (usuarios, hashes das chaves, overrides, auditoria).

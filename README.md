@@ -10,9 +10,10 @@ Telegram ──> bot (docker.sock) ──> /data/behavior_packs, /data/resource_
 Jogadores ──TCP 19132 + UDP 19133-72────────────────────> mine-bedrock (VERSION=LATEST)
 ```
 
-- `bds`: `itzg/minecraft-bedrock-server:stable` com `VERSION=LATEST`. Publica
-  direto no host as duas etapas do nethernet: `TCP 19132` (signalling) e
-  `UDP 19133-19172` (gameplay). Nao ha proxy no meio.
+- `bds`: `itzg/minecraft-bedrock-server:stable` com `VERSION=LATEST`. Roda em
+  `network_mode: host`, entao escuta direto na interface da maquina as duas
+  etapas do nethernet: `TCP 19132` (signalling) e `UDP 19133-19172` (gameplay).
+  Nao ha proxy no meio e nao ha `ports:` no compose.
 - `bot`: Python + aiogram, fala com o Docker pelo socket, faz o restart
   diario as 05:00 e responde so a quem tem o codigo de resgate (admin) ou uma
   chave de leitura.
@@ -92,23 +93,40 @@ Regras que o bot aplica:
 
 ## Conectar ao servidor
 
-1. O `compose.yml` ja publica `19132/tcp` e a faixa `19133-19172/udp` direto no
-   container do jogo. A faixa tem que bater com o `server-udp-ports` do
-   `data/server.properties`; se mudar la, mude no compose tambem.
-2. Liberar as duas no firewall da maquina e no painel do provedor. No UFW sao 2
-   comandos, porque faixa e uma regra so:
-   `ufw allow 19132/tcp` e `ufw allow 19133:19172/udp`
+1. O `compose.yml` roda o `bds` em `network_mode: host`, entao o container
+   escuta direto no host: nao existe bloco `ports:` e nao existe mapeamento.
+   A faixa UDP tem que bater com o `server-udp-ports` do
+   `data/server.properties`; se mudar la, mude no firewall tambem.
+2. Liberar no firewall da maquina e no painel do provedor. No UFW:
+   `ufw allow 19132/tcp`, `ufw allow 7551/udp` e `ufw allow 19133:19172/udp`.
 3. No Cloudflare, o registro do jogo fica **so DNS (cinza)**.
 
 Os jogadores entram em **Adicionar servidor -> Endereço -> `seu.dominio`**.
 
-> **Por que duas portas.** O BDS 1.26.52+ usa `transport=nethernet`, que nao e um
-> protocolo so. O cliente primeiro abre um socket **TCP** em 19132 para um
-> handshake HTTP de signalling (e o que o log do servidor anuncia:
-> `Accepting clients on [::]:19132`), e so depois negocia por **UDP** o trafego
-> de jogo via WebRTC. Como essa segunda etapa sorteia portas efemeras do
-> sistema, atras de NAT ela nao funciona sem faixa fixa - e o que o
-> `server-udp-ports=19133-19172:19133-19172` resolve.
+> **Por que `network_mode: host` e nao `ports:`.** O BDS 1.26.52+ usa
+> `transport=nethernet`, que nao e so "abrir a porta". O cliente primeiro abre
+> um socket **TCP** em 19132 para um handshake HTTP de signalling (e o que o
+> log do servidor anuncia: `Accepting clients on [::]:19132`), e so depois
+> negocia por **UDP** o trafego de jogo via WebRTC.
+>
+> Nessa segunda etapa o servidor sorteia candidatos ICE a partir das
+> interfaces que ele enxerga e **anuncia um deles** pelo servico de signalling
+> da Mojang - o cliente tenta aquele endereco, ele nao pergunta. Em rede bridge
+> ele enxerga so a interface do container (`172.22.0.x`) e anuncia isso, que
+> ninguem da internet alcanca. O sintoma e enganoso: o `/v1/join` responde JSON,
+> o servidor aparece na lista, e a conexao morre em `Door` /
+> `InitialConnection-NN` **sem nenhum evento no console do BDS**.
+>
+> Por isso nao adianta publicar porta: `ports:` muda onde o pacote chega, nao
+> o endereco que o servidor anuncia. Todo config que funciona com esse
+> transporte usa rede host. O `UDP 7551` ja vem aberto sozinho em qualquer
+> config (e' porta fixa do NetherNet, nao a que o `server-udp-ports` move), e o
+> socket de gameplay so aparece no `/proc/net/udp6` enquanto alguem esta
+> conectando - entao a faixa so da para conferir com o jogo aberto.
+>
+> Se a rede host nao bastar (NAT do provedor sem porta fixa, maquina com varios
+> IPs), da para fixar o IP anunciado com `SERVER_IP=<ip-publico>` no `.env`.
+> O preco: com o IP fixado, quem estiver na mesma LAN deixa de entrar.
 
 ## Sobre o icone
 
@@ -378,13 +396,13 @@ O nethernet tem duas etapas, e cada uma tem um sintoma proprio. Comece sempre
 pela de dentro:
 
 ```bash
-# 1. o BDS responde o signalling TCP?
-docker exec mine-bedrock sh -c 'printf "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" | nc 127.0.0.1 19132'
-# 2. as portas estao publicadas no host?
-docker compose port bds 19132
-netstat -an | findstr 19132
-netstat -an | findstr ":191 "   # 40 linhas de UDP, 19133-19172
-# 3. o gameplay usou a faixa fixa? (so com alguem conectado)
+# 1. o BDS responde o signalling TCP? (o /v1/join e' o endpoint do nethernet)
+curl -s http://127.0.0.1:19132/v1/join
+# 2. o bds esta em rede host mesmo? (tem que aparecer, e o "Server started." no log)
+docker inspect -f '{{.HostConfig.NetworkMode}}' mine-bedrock
+# 3. as portas estao abertas no firewall da maquina?
+ss -lntup | grep -E ':(19132|7551|1913[3-9]|19[1-6][0-9]|1917[0-2])\b'
+# 4. o gameplay usou a faixa fixa? (so da pra ver com alguem conectando)
 docker exec mine-bedrock sh -c "awk '{print \$2}' /proc/net/udp6"
 ```
 
@@ -393,13 +411,23 @@ Sintoma por etapa:
 | o que voce ve | causa provavel |
 | --- | --- |
 | passo 1 nao responde | o BDS nao subiu, ou `server-port` mudou |
-| passo 1 responde, mas da rede nao conecta | porta nao publicada, ou firewall/ingress do provedor bloqueando |
-| a rede conecta e o jogo trava ao spawnar | **falta a faixa UDP**: `server-udp-ports` vazio ou divergente da faixa publicada, ou o firewall bloqueando 19133-19172 |
-| passo 3 mostra porta efemera (`7FFE` etc) | `server-udp-ports` nao foi honrado; o gameplay sorteia porta e morre atras de NAT |
-| tudo acima ok e o jogo nao entra | DNS/Cloudflare: o registro tem que ser **cinza** |
+| passo 1 responde, mas da rede nao conecta | `19132/tcp` fechada no firewall/ingress do provedor |
+| `NetworkMode` do container != `host` | volte ao `compose.yml`: em bridge o nethernet anuncia o IP privado do container e nenhum ajuste de porta resolve |
+| a rede conecta e o jogo trava ao spawnar | **falta a faixa UDP**: `server-udp-ports` vazio ou divergente da faixa liberada, ou o firewall bloqueando 19133-19172 |
+| passo 4 mostra porta efemera (`7FFE` etc) | `server-udp-ports` nao foi honrado; o gameplay sorteia porta e morre atras de NAT |
+| so da rede local funciona, de fora nao | deve ser NAT/ingress do provedor: teste com `SERVER_IP=<ip-publico>` no `.env` |
+| tudo acima ok e o jogo nao entra | DNS/Cloudflare: o registro tem que ser **cinza** (Cloudflare nao proxya UDP) |
 
-Nao use `mc-monitor` para diagnosticar: ele faz ping raknet e o nethernet nao
-responde, entao da erro mesmo com o servidor perfeito.
+Duas regras do `server-udp-ports` que valem no BDS 1.26.51+, e que nao dao erro
+quando estao erradas - o servidor sobe e loga `Server started.` normalmente:
+
+1. **So funciona 1:1.** `externo` tem que ser igual a `interno`
+   (`19133-19172:19133-19172` ok; `61226:19133` abre o servidor e nunca escuta).
+2. **Precisa estar no arquivo antes do boot.** O BDS le `server.properties` uma
+   vez so. Mudou la, tem que reiniciar o `bds`.
+
+> Nao use `mc-monitor` para diagnosticar: ele faz ping raknet e o nethernet nao
+> responde, entao da erro mesmo com o servidor perfeito. Use o `/v1/join`.
 
 ## Manutencao
 
